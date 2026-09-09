@@ -1,0 +1,24 @@
+# Secrets — must never enter a build layer. .gitignore does not apply to build context.
+.env
+.env.*
+!.env.example
+
+# Virtualenv — deps get installed inside the image
+.venv/
+venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Not needed at runtime
+tests/
+docs/
+*.md
+!README.md

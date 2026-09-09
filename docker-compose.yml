@@ -1,0 +1,154 @@
+services:
+
+  # ==========================================
+  # PostgreSQL
+  # ==========================================
+  postgres:
+    image: postgres:18
+    container_name: rag_postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      # Postgres 18+ expects a single mount here; PGDATA is /var/lib/postgresql/18/docker
+      - postgres_data:/var/lib/postgresql
+      - ./infrastructure/postgres/init:/docker-entrypoint-initdb.d
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - rag_network
+  
+  # ==========================================
+  # PgBouncer — connection pooler
+  # ==========================================
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.23.1-p3
+    container_name: rag_pgbouncer
+    restart: unless-stopped
+
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      AUTH_TYPE: scram-sha-256
+      # Image defaults to 5432; PgBouncer conventionally uses 6432
+      LISTEN_PORT: 6432
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 20
+      MIN_POOL_SIZE: 5
+      RESERVE_POOL_SIZE: 5
+      SERVER_IDLE_TIMEOUT: 600
+
+    ports:
+      - "127.0.0.1:${PGBOUNCER_PORT:-6432}:6432"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - rag_network
+  # ==========================================
+  # Redis
+  # ==========================================
+  redis:
+    image: redis:8
+    container_name: rag_redis
+    restart: unless-stopped
+
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD}
+
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+
+    volumes:
+      - redis_data:/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - rag_network
+
+  # ==========================================
+  # Qdrant
+  # ==========================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: rag_qdrant
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:${QDRANT_HTTP_PORT:-6333}:6333"
+      - "127.0.0.1:${QDRANT_GRPC_PORT:-6334}:6334"
+
+    volumes:
+      - qdrant_data:/qdrant/storage
+    
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - rag_network
+
+# ==========================================
+# Persistent Volumes
+# ==========================================
+volumes:
+
+  postgres_data:
+    name: rag_postgres_data
+    
+
+  redis_data:
+    name: rag_redis_data
+
+  qdrant_data:
+    name: rag_qdrant_data
+
+
+
+
+# ==========================================
+# Internal Network
+# ==========================================
+networks:
+
+  rag_network:
+    name: rag_network
+    driver: bridge

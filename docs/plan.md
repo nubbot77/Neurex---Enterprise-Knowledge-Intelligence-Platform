@@ -294,229 +294,220 @@ frontend/
 
 The backend is completely independent from the frontend.
 
+Layout follows the Python `src/` convention: a single `src/` root holds every importable
+package, and each top-level package under it is either a deployable service (`api`,
+`workers/*`) or shared library code (`shared/*`). `src/` is placed on the import path,
+so imports read `from api.config.settings import Settings` and
+`from shared.storage.base import StorageProvider`.
+
+Two rules keep this navigable:
+
+1. **One wrapper level only.** No `apps/api/app/` chains.
+2. **Never repeat a name across nesting levels.** Route files live in `api/routes/`,
+   not `api/api/`.
+
 ```text
 backend/
 │
-├── apps/
+├── src/
 │   │
-│   └── api/
+│   ├── api/                            # FastAPI service — deployable
+│   │   │
+│   │   ├── main.py                     # app factory + lifespan
+│   │   │
+│   │   ├── routes/
+│   │   │   ├── dependencies.py
+│   │   │   ├── router.py
+│   │   │   │
+│   │   │   └── v1/
+│   │   │       ├── auth.py
+│   │   │       ├── users.py
+│   │   │       ├── tenants.py
+│   │   │       ├── documents.py
+│   │   │       ├── document_versions.py
+│   │   │       ├── ingestion_jobs.py
+│   │   │       ├── search.py
+│   │   │       ├── conversations.py
+│   │   │       ├── messages.py
+│   │   │       ├── evaluations.py
+│   │   │       └── health.py
+│   │   │
+│   │   ├── auth/
+│   │   │   ├── dependencies.py
+│   │   │   ├── jwt.py
+│   │   │   ├── password.py
+│   │   │   └── permissions.py
+│   │   │
+│   │   ├── config/
+│   │   │   ├── settings.py
+│   │   │   └── logging.py
+│   │   │
+│   │   ├── db/
+│   │   │   ├── session.py
+│   │   │   ├── base.py
+│   │   │   │
+│   │   │   ├── models/
+│   │   │   │   ├── user.py
+│   │   │   │   ├── tenant.py
+│   │   │   │   ├── document.py
+│   │   │   │   ├── document_version.py
+│   │   │   │   ├── chunk.py
+│   │   │   │   ├── ingestion_job.py
+│   │   │   │   ├── conversation.py
+│   │   │   │   └── message.py
+│   │   │   │
+│   │   │   └── repositories/
+│   │   │       ├── users.py
+│   │   │       ├── tenants.py
+│   │   │       ├── documents.py
+│   │   │       └── conversations.py
+│   │   │
+│   │   ├── schemas/
+│   │   │   ├── auth.py
+│   │   │   ├── users.py
+│   │   │   ├── tenants.py
+│   │   │   ├── documents.py
+│   │   │   ├── ingestion.py
+│   │   │   ├── search.py
+│   │   │   ├── chat.py
+│   │   │   └── evaluations.py
+│   │   │
+│   │   ├── services/
+│   │   │   ├── auth_service.py
+│   │   │   ├── document_service.py
+│   │   │   ├── conversation_service.py
+│   │   │   └── evaluation_service.py
+│   │   │
+│   │   ├── middleware/
+│   │   │   ├── request_id.py
+│   │   │   ├── tenant.py
+│   │   │   ├── rate_limit.py
+│   │   │   └── security.py
+│   │   │
+│   │   └── streaming/
+│   │       └── sse.py
+│   │
+│   ├── workers/
+│   │   │
+│   │   ├── ingestion/                  # deployable
+│   │   │   ├── main.py
+│   │   │   ├── pipeline.py
+│   │   │   │
+│   │   │   ├── detection/
+│   │   │   │   ├── file_detector.py
+│   │   │   │   └── content_detector.py
+│   │   │   │
+│   │   │   ├── parsers/
+│   │   │   │   ├── base.py
+│   │   │   │   ├── pdf_parser.py
+│   │   │   │   ├── docx_parser.py
+│   │   │   │   ├── html_parser.py
+│   │   │   │   ├── markdown_parser.py
+│   │   │   │   ├── csv_parser.py
+│   │   │   │   └── web_parser.py
+│   │   │   │
+│   │   │   ├── ocr/
+│   │   │   │   ├── base.py
+│   │   │   │   ├── rapidocr_provider.py
+│   │   │   │   ├── tesseract_provider.py
+│   │   │   │   ├── paddleocr_provider.py
+│   │   │   │   └── router.py
+│   │   │   │
+│   │   │   ├── normalization/
+│   │   │   │   ├── canonical_document.py
+│   │   │   │   ├── normalizer.py
+│   │   │   │   └── metadata.py
+│   │   │   │
+│   │   │   ├── cleaning/
+│   │   │   │   ├── cleaner.py
+│   │   │   │   ├── headers.py
+│   │   │   │   ├── footers.py
+│   │   │   │   └── boilerplate.py
+│   │   │   │
+│   │   │   └── chunking/
+│   │   │       ├── base.py
+│   │   │       ├── structure_chunker.py
+│   │   │       ├── contextual_chunker.py
+│   │   │       └── token_counter.py
+│   │   │
+│   │   ├── embeddings/                 # deployable
+│   │   │   ├── main.py
+│   │   │   ├── batcher.py
+│   │   │   └── processor.py
+│   │   │
+│   │   └── evaluation/
+│   │       ├── main.py
+│   │       └── runner.py
+│   │
+│   └── shared/                         # library code — imported, never deployed
 │       │
-│       ├── app/
+│       ├── retrieval/
+│       │   ├── interfaces.py
+│       │   ├── pipeline.py
 │       │   │
-│       │   ├── main.py
+│       │   ├── lexical/
+│       │   │   ├── retriever.py
+│       │   │   └── ranking.py
 │       │   │
-│       │   ├── api/
-│       │   │   ├── dependencies.py
-│       │   │ ├── router.py
-│       │   │ │
-│       │   │ └── v1/
-│       │   │     ├── auth.py
-│       │   │     ├── users.py
-│       │   │     ├── tenants.py
-│       │   │     ├── documents.py
-│       │   │     ├── document_versions.py
-│       │   │     ├── ingestion_jobs.py
-│       │   │     ├── search.py
-│       │   │     ├── conversations.py
-│       │   │     ├── messages.py
-│       │   │     ├── evaluations.py
-│       │   │     └── health.py
+│       │   ├── dense/
+│       │   │   ├── retriever.py
+│       │   │   └── filters.py
 │       │   │
-│       │   ├── auth/
-│       │   │   ├── dependencies.py
-│       │   │   ├── jwt.py
-│       │   │   ├── password.py
-│       │   │   └── permissions.py
+│       │   ├── fusion/
+│       │   │   └── rrf.py
 │       │   │
-│       │   ├── config/
-│       │   │   ├── settings.py
-│       │   │   └── logging.py
-│       │   │
-│       │   ├── database/
-│       │   │   ├── session.py
+│       │   ├── reranking/
 │       │   │   ├── base.py
-│       │   │   │
-│       │   │   ├── models/
-│       │   │   │   ├── user.py
-│       │   │   │   ├── tenant.py
-│       │   │   │   ├── document.py
-│       │   │   │   ├── document_version.py
-│       │   │   │   ├── chunk.py
-│       │   │   │   ├── ingestion_job.py
-│       │   │   │   ├── conversation.py
-│       │   │   │   └── message.py
-│       │   │   │
-│       │   │   └── repositories/
-│       │   │       ├── users.py
-│       │   │       ├── tenants.py
-│       │   │       ├── documents.py
-│       │   │       └── conversations.py
+│       │   │   └── cross_encoder.py
 │       │   │
-│       │   ├── schemas/
-│       │   │   ├── auth.py
-│       │   │   ├── users.py
-│       │   │   ├── tenants.py
-│       │   │   ├── documents.py
-│       │   │   ├── ingestion.py
-│       │   │   ├── search.py
-│       │   │   ├── chat.py
-│       │   │   └── evaluations.py
+│       │   ├── query/
+│       │   │   ├── classifier.py
+│       │   │   ├── rewriter.py
+│       │   │   └── filters.py
 │       │   │
-│       │   ├── services/
-│       │   │   ├── auth_service.py
-│       │   │   ├── document_service.py
-│       │   │   ├── conversation_service.py
-│       │   │   └── evaluation_service.py
-│       │   │
-│       │   ├── middleware/
-│       │   │   ├── request_id.py
-│       │   │   ├── tenant.py
-│       │   │   ├── rate_limit.py
-│       │   │   └── security.py
-│       │   │
-│       │   └── streaming/
-│       │       └── sse.py
+│       │   └── context/
+│       │       ├── builder.py
+│       │       ├── deduplicator.py
+│       │       └── budget.py
 │       │
-│       └── tests/
-│           ├── unit/
-│           ├── integration/
-│           └── api/
+│       ├── llm/
+│       │   ├── base.py
+│       │   ├── openai_compatible.py
+│       │   ├── local.py
+│       │   └── factory.py
+│       │
+│       ├── embeddings/
+│       │   ├── base.py
+│       │   ├── local.py
+│       │   ├── api.py
+│       │   └── factory.py
+│       │
+│       ├── storage/
+│       │   ├── base.py
+│       │   └── r2.py
+│       │
+│       ├── vector_store/
+│       │   ├── base.py
+│       │   └── qdrant.py
+│       │
+│       ├── queue/
+│       │   ├── base.py
+│       │   └── redis_queue.py
+│       │
+│       └── common/
 │
-├── workers/
-│   │
-│   ├── ingestion/
-│   │   ├── main.py
-│   │   ├── pipeline.py
-│   │   │
-│   │   ├── detection/
-│   │   │   ├── file_detector.py
-│   │   │   └── content_detector.py
-│   │   │
-│   │   ├── parsers/
-│   │   │   ├── base.py
-│   │   │   ├── pdf_parser.py
-│   │   │   ├── docx_parser.py
-│   │   │   ├── html_parser.py
-│   │   │   ├── markdown_parser.py
-│   │   │   ├── csv_parser.py
-│   │   │   └── web_parser.py
-│   │   │
-│   │   ├── ocr/
-│   │   │   ├── base.py
-│   │   │   ├── rapidocr_provider.py
-│   │   │   ├── tesseract_provider.py
-│   │   │   ├── paddleocr_provider.py
-│   │   │   └── router.py
-│   │   │
-│   │   ├── normalization/
-│   │   │   ├── canonical_document.py
-│   │   │   ├── normalizer.py
-│   │   │   └── metadata.py
-│   │   │
-│   │   ├── cleaning/
-│   │   │   ├── cleaner.py
-│   │   │   ├── headers.py
-│   │   │   ├── footers.py
-│   │   │   └── boilerplate.py
-│   │   │
-│   │   └── chunking/
-│   │       ├── base.py
-│   │       ├── structure_chunker.py
-│   │       ├── contextual_chunker.py
-│   │       └── token_counter.py
-│   │
-│   ├── embeddings/
-│   │   ├── main.py
-│   │   ├── batcher.py
-│   │   └── processor.py
-│   │
-│   └── evaluation/
-│       ├── main.py
-│       └── runner.py
-│
-├── packages/
-│   │
-│   ├── retrieval/
-│   │   ├── interfaces.py
-│   │   ├── pipeline.py
-│   │   │
-│   │   ├── lexical/
-│   │   │   ├── retriever.py
-│   │   │   └── ranking.py
-│   │   │
-│   │   ├── dense/
-│   │   │   ├── retriever.py
-│   │   │   └── filters.py
-│   │   │
-│   │   ├── fusion/
-│   │   │   └── rrf.py
-│   │   │
-│   │   ├── reranking/
-│   │   │   ├── base.py
-│   │   │   └── cross_encoder.py
-│   │   │
-│   │   ├── query/
-│   │   │   ├── classifier.py
-│   │   │   ├── rewriter.py
-│   │   │   └── filters.py
-│   │   │
-│   │   └── context/
-│   │       ├── builder.py
-│   │       ├── deduplicator.py
-│   │       └── budget.py
-│   │
-│   ├── llm/
-│   │   ├── base.py
-│   │   ├── openai_compatible.py
-│   │   ├── local.py
-│   │   └── factory.py
-│   │
-│   ├── embeddings/
-│   │   ├── base.py
-│   │   ├── local.py
-│   │   ├── api.py
-│   │   └── factory.py
-│   │
-│   ├── storage/
-│   │   ├── base.py
-│   │   └── r2.py
-│   │
-│   ├── vector_store/
-│   │   ├── base.py
-│   │   └── qdrant.py
-│   │
-│   ├── queue/
-│   │   ├── base.py
-│   │   └── redis_queue.py
-│   │
-│   └── common/
-│       ├── errors/
-│       ├── logging/
-│       ├── telemetry/
-│       ├── security/
-│       ├── ids/
-│       └── utilities/
-│
-├── evaluation/
-│   │
+├── evaluation/                         # datasets, metrics, judges, reports
 │   ├── datasets/
-│   │   ├── samples/
-│   │   └── schemas/
-│   │
 │   ├── metrics/
 │   │   ├── retrieval.py
-│   │   ├── generation.py
 │   │   ├── citations.py
 │   │   ├── latency.py
 │   │   └── cost.py
-│   │
 │   ├── judges/
 │   │   ├── groundedness.py
 │   │   └── correctness.py
-│   │
 │   ├── runners/
 │   │   └── evaluation_runner.py
-│   │
 │   └── reports/
 │
 ├── migrations/
@@ -527,13 +518,48 @@ backend/
 │   ├── unit/
 │   ├── integration/
 │   ├── e2e/
+│   ├── api/
 │   ├── retrieval/
 │   └── security/
 │
+├── .dockerignore
 ├── pyproject.toml
 ├── uv.lock
 └── .env.example
 ```
+
+## Import path configuration
+
+`src/` goes on the import path; nothing is pip-installed. `pyproject.toml` declares:
+
+```toml
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+src = ["src", "tests"]
+```
+
+Run the API from `backend/`:
+
+```bash
+uv run uvicorn api.main:app --reload --app-dir src
+```
+
+## Docker build contexts
+
+Each deployable builds from `backend/` as its context, selecting a different Dockerfile.
+All three backend images copy `src/shared/` plus their own service directory.
+
+| Image | Dockerfile | Entry point |
+|---|---|---|
+| API | `infrastructure/docker/api.Dockerfile` | `api.main:app` |
+| Ingestion worker | `infrastructure/docker/ingestion-worker.Dockerfile` | `workers.ingestion.main` |
+| Embedding worker | `infrastructure/docker/embedding-worker.Dockerfile` | `workers.embeddings.main` |
+
 
 ---
 

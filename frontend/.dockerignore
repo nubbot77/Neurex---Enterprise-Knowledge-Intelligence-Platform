@@ -1,0 +1,13 @@
+# Secrets — must never enter a build layer. .gitignore does not apply to build context.
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+
+*.md
+!README.md
