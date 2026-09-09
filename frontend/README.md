@@ -1,73 +1,78 @@
-# React + TypeScript + Vite
+# Neurex Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Frontend for the Enterprise Knowledge Intelligence Platform — React 19, TypeScript, Vite, Tailwind CSS v4.
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **React 19 + TypeScript** — strict mode, no `any`
+- **Vite** — dev server and build
+- **Tailwind CSS v4** — CSS-first theme tokens in `src/index.css`, light/dark via `.dark` class
+- **React Router v7** (data router) — route-level code splitting via `lazy`
+- **TanStack Query** — server state, caching, mutations
+- **Zustand** — client state only (`stores/authStore.ts`, `stores/themeStore.ts`, `stores/uiStore.ts`)
+- **React Hook Form + Zod** — forms and validation
+- **class-variance-authority + tailwind-merge** — component variants
+- **Motion** — enter/exit transitions (dialogs, dropdowns, tooltips)
+- **Vitest + React Testing Library** — unit/component tests
+- **Playwright** — e2e tests
 
-## React Compiler
+## Getting started
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-]);
+```bash
+npm install
+cp .env.example .env   # set VITE_API_URL to your backend
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
+## Scripts
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x';
-import reactDom from 'eslint-plugin-react-dom';
+| Script                            | Purpose                                              |
+| --------------------------------- | ---------------------------------------------------- |
+| `npm run dev`                     | Start the Vite dev server                            |
+| `npm run build`                   | Type-check (`tsc -b`) then production build          |
+| `npm run preview`                 | Serve the production build locally                   |
+| `npm run lint`                    | ESLint (type-checked rules)                          |
+| `npm run format` / `format:check` | Prettier                                             |
+| `npm run typecheck`               | `tsc -b` only                                        |
+| `npm run test`                    | Vitest unit/component tests                          |
+| `npm run test:watch`              | Vitest in watch mode                                 |
+| `npm run test:e2e`                | Playwright e2e tests (builds + serves the app first) |
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-]);
+## Project structure
+
 ```
+src/
+├── app/            App shell entry: App.tsx, router.tsx, providers.tsx, ErrorBoundary.tsx
+├── components/
+│   ├── ui/         Design-system primitives (Button, Dialog, Table, ...)
+│   ├── layout/     AppShell, Sidebar, Topbar, AuthLayout, ...
+│   ├── chat/        Chat UI
+│   └── citations/   Citation chips + source preview
+├── features/       Business logic by domain: api.ts, hooks.ts, schemas.ts,
+│                    types.ts, components/ (authentication, document-management,
+│                    ingestion-monitoring, search, conversations, evaluations, settings)
+├── pages/          Route-level page components
+├── services/
+│   ├── api/         apiClient, ApiError, shared request types
+│   └── streaming/    Chat SSE streaming
+├── stores/         Zustand stores (client state only)
+├── hooks/          Cross-feature hooks (useDebouncedValue, ...)
+├── types/          Shared API envelope types
+└── utils/          cn, format, highlight
+```
+
+## Backend contract
+
+No backend exists yet in this repo. Every `features/*/api.ts` file targets a REST path
+(`/documents`, `/search`, `/chat/messages`, `/evaluations/...`, `/settings`, ...) that a
+future FastAPI service is expected to implement — see the comment at the top of each
+`api.ts`. Until then, every data-driven page correctly shows its error state (network
+requests to `VITE_API_URL` fail) rather than crashing.
+
+## Environment variables
+
+| Variable       | Required | Description                 |
+| -------------- | -------- | --------------------------- |
+| `VITE_API_URL` | Yes      | Base URL of the backend API |
+
+`VITE_*` variables are bundled into the client and are public — never put secrets here.

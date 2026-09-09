@@ -1,6 +1,8 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { initializeSession } from '@/features/authentication/session';
+import { applyThemeClass } from '@/stores/themeStore';
 
 interface ProvidersProps {
   children: ReactNode;
@@ -18,6 +20,11 @@ export function Providers({ children }: ProvidersProps) {
         },
       }),
   );
+
+  useEffect(() => applyThemeClass(), []);
+  useEffect(() => {
+    void initializeSession();
+  }, []);
 
   return (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
