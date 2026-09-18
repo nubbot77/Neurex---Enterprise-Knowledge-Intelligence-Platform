@@ -1,19 +1,20 @@
 # Handover
 
 **Project:** Neurex — Enterprise Knowledge Intelligence Platform
-**Last updated:** 2026-09-18
+**Last updated:** 2026-09-19
 **Progress:** Phases 0–2 complete, Phase 3 at 4/8 tasks — **3.5 of 34 phases**
 
 Task list and full phase breakdown: `docs/backend_tasks.md`
+Identity, tenancy and RBAC specification: `docs/architecture.md` §7
 Architecture and directory structure: `docs/plan.md`
 
 ---
 
 ## 1. Where to pick up
 
-**Next task: Phase 3, Task 5 — `User` and `Tenant` models.**
+**Next task: Phase 3, Task 5 — `User`, `Organization`, and `Membership` models.**
 
-Before writing them, read section 4 below. The three-role requirement changes where `role` lives, and `User` needs `is_super_admin` **from the start** so it lands in the first migration rather than requiring a backfill later.
+Three models, not two. The identity and tenancy model is now specified in full in `architecture.md` §7 — read it before writing them. Summary of what it changes: `role` lives on `Membership`, not `User`; solo users get a personal `Organization` so `organization_id` is `NOT NULL` everywhere; `User.is_super_admin` must be in this first migration rather than backfilled later.
 
 After Task 5: Task 6 (first real migration), Task 7 (repository base class), Task 8 (verify migration round-trip on a fresh DB).
 
@@ -71,7 +72,7 @@ Verified live: startup log fires, `/api/v1/health` returns `200 {"status":"ok"}`
 | 2 | `db/session.py` — async engine, session-per-request | ✅ |
 | 3 | PgBouncer-compatible engine config | ✅ proven, see 5.3 |
 | 4 | Alembic init + wiring | ✅ |
-| 5 | First models: `User`, `Tenant` | ⬜ **next** |
+| 5 | First models: `User`, `Organization`, `Membership` | ⬜ **next** |
 | 6 | First migration | ⬜ |
 | 7 | Repository base class | ⬜ |
 | 8 | Verify migration round-trip | ⬜ |
@@ -136,23 +137,44 @@ Dev: `ruff`, `colorama`
 
 ---
 
-## 4. Open requirement — three roles
+## 4. Identity and RBAC model — specified
 
-The platform needs exactly three roles: **super_admin**, **admin**, **user**. Because the system is multi-tenant, a single `User.role` column is the wrong shape — one user can belong to several tenants with a different role in each.
+**Resolved 2026-09-19.** Full specification: `architecture.md` §7. Summary:
 
-Agreed design:
+```text
+User ──────< Membership >────── Organization
+(global identity)   (role, account_type, status)   (tenant)
+```
 
 | Role | Lives on | Scope |
 |---|---|---|
-| `super_admin` | `User.is_super_admin` (boolean) | Platform-wide, **not** tenant-scoped |
-| `admin` | `Membership.role` | One tenant |
-| `user` | `Membership.role` | One tenant |
+| `super_admin` | `User.is_super_admin` | Platform-wide, **not** organization-scoped |
+| `admin` | `Membership.role` | One organization, 1 to `max_admins` (default 2) per org |
+| `member` | `Membership.role` | One organization |
 
-`super_admin` is a deliberate hole in tenant isolation. Phase 5 Task 4 builds a base repository that forces a `tenant_id` filter on every query; a platform operator needs to bypass it. That bypass must be **explicit** (a named parameter, never an implicit branch buried in the repository), **audited** (log who read across tenants and why), and ideally **read-only**. An unaudited bypass is exactly what Phase 5's adversarial test suite exists to catch.
+Decisions that affect Task 5 directly:
 
-Action for Task 5: put `is_super_admin` on `User` now.
+- **Role is on the membership.** One person can be `admin` in one organization and
+  `member` in another. A `role` column on `User` cannot express that.
+- **Solo users get a personal organization** (`Organization.kind = 'personal'`),
+  created in the same transaction as registration. This is what lets
+  `organization_id` be `NOT NULL` on every tenant-scoped table with no nullable-owner
+  branch — see §7.3 for why the nullable alternative was rejected.
+- **`User.is_super_admin` goes in now**, so it lands in the first migration instead of
+  needing a backfill.
+- **`account_type`** (`member` / `guest` / `service`) is billing metadata and never
+  participates in an authorization decision.
+- **Admin count is a range, not a cap** — at least one, at most `max_admins`. A cap
+  alone lets the last admin strand the organization with nobody who can manage it.
+  Enforced by a counter column plus `CHECK` on `organizations`, maintained by a
+  trigger; a counting trigger would be racy (§7.7).
 
----
+`super_admin` is a deliberate hole in tenant isolation. Phase 5 builds a base
+repository that forces an `organization_id` filter on every query; a platform operator
+needs to bypass it. That bypass must be **explicit** (a named parameter, never an
+implicit branch buried in the repository), **audited** (log who read across
+organizations and why), and **read-only**. An unaudited bypass is exactly what Phase
+5's adversarial test suite exists to catch.
 
 ## 5. Gotchas — things that already cost time
 

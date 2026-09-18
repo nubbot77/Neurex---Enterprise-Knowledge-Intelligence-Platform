@@ -80,7 +80,7 @@ Every task includes a plain-language description of what it does and why it matt
 | 2 | `api/db/session.py` — async engine + session-per-request | Medium |
 | 3 | PgBouncer-compatible engine config (`NullPool`, `statement_cache_size=0`) | High |
 | 4 | Alembic init + config wiring to `Settings` (separate direct-to-Postgres URL) | Medium |
-| 5 | First models: `User`, `Tenant` | Medium |
+| 5 | First models: `User`, `Organization`, `Membership` | Medium |
 | 6 | First migration (autogenerate + review) | Medium |
 | 7 | Repository pattern base class | Medium |
 | 8 | Verify migration round-trip on fresh DB | Low |
@@ -93,7 +93,9 @@ Every task includes a plain-language description of what it does and why it matt
 
 **4. Alembic.** Version control for your database structure. Instead of manually running `ALTER TABLE` on every machine, you write migration files that apply the same changes everywhere in the same order. Migrations must connect *directly* to Postgres, bypassing the pooler, because they need a connection that stays put.
 
-**5. First models.** `User` and `Tenant` as Python classes that map to database tables.
+**5. First models.** `User`, `Organization`, and `Membership` as Python classes that map to database tables.
+
+Three, not two. `User` is a global identity with no role column; `Organization` is a tenant; `Membership` links them and carries `role`, `account_type`, and `status`. The role has to live on the membership because one person can be an admin in one organization and an ordinary member in another — a `role` column on `User` cannot express that. `User.is_super_admin` is the exception: it is platform-level, belongs to no organization, and must be in this first migration rather than backfilled later. Architecture §7 has the full model, including why solo users get a personal organization instead of a nullable `organization_id`.
 
 **6. First migration.** Auto-generate the SQL from your models — then **read it before running it**. Auto-generation regularly gets things subtly wrong, and a bad migration on a live database is expensive.
 
@@ -111,7 +113,7 @@ Every task includes a plain-language description of what it does and why it matt
 | 2 | `api/auth/jwt.py` — token encode/decode, claims, expiry | Medium |
 | 3 | Access token + refresh token lifecycle | High |
 | 4 | `api/schemas/auth.py` — request/response models | Low |
-| 5 | `api/services/auth_service.py` | Medium |
+| 5 | `api/services/auth_service.py` — register creates `User` + personal `Organization` + `Membership` in one transaction | Medium |
 | 6 | `api/routes/v1/auth.py` — register/login/refresh/logout routes | Medium |
 | 7 | `api/auth/dependencies.py` — `get_current_user` injection | Medium |
 | 8 | Redis client setup (needed for revocation) | Low |
@@ -122,11 +124,15 @@ Every task includes a plain-language description of what it does and why it matt
 
 **2. JWT tokens.** After login the user gets a signed token they send with every request. The signature proves it came from you and wasn't edited, so you don't have to look up a session in the database every time.
 
+The token carries `user_id` and nothing about authority — no role, no organization. A role baked into a token keeps asserting itself until the token expires, so a demotion or a suspended membership would take minutes to apply. Phase 5 resolves role per request instead, cached in Redis and invalidated on write.
+
 **3. Access + refresh tokens.** Two tokens with different lifespans. The access token expires in minutes, so a stolen one is quickly useless. The refresh token lives for days and quietly gets new access tokens, so users aren't logged out constantly. Getting the handoff right is genuinely tricky — it's where most auth bugs live.
 
 **4. Schemas.** The shapes of the JSON going in and out. Defined before the routes, because the routes use them.
 
 **5. Auth service.** The actual logic — check the password, issue tokens, refresh them. Kept separate from routes so it can be tested without HTTP and reused elsewhere.
+
+Registration writes three rows, not one, in a single transaction: the `User`, a personal `Organization` (`kind = 'personal'`), and the `Membership` making them its admin. Every user therefore owns an organization from the first second, which is what lets `organization_id` be `NOT NULL` on every tenant-scoped table with no nullable-owner special case (architecture §7.3).
 
 **6. Routes.** The URLs (`/register`, `/login`, `/refresh`, `/logout`) that call the service. They come *after* the service, because they depend on it.
 
@@ -140,27 +146,82 @@ Every task includes a plain-language description of what it does and why it matt
 
 ---
 
-## Phase 5 — Multi-Tenancy
+## Phase 5 — Multi-Tenancy and RBAC
 
 | # | Task | Difficulty |
 |---|---|---|
-| 1 | `Organization` + `Membership` models, extend `Tenant` | Medium |
-| 2 | Migration for tenancy models | Low |
-| 3 | `api/middleware/tenant.py` — tenant context resolution per request | High |
-| 4 | Tenant-scoped base repository (mandatory `tenant_id` filter) | High |
-| 5 | Retrofit all repositories to require `tenant_id` | Medium |
-| 6 | Cross-tenant isolation test suite (adversarial: guessed IDs) | High |
-| 7 | Role-based access control (RBAC) scaffold | High |
+| 1 | Membership lifecycle service — invite, accept, suspend, remove | Medium |
+| 2 | `api/auth/permissions.py` — `Permission` enum + role→permission matrix | Medium |
+| 3 | `api/auth/context.py` — `OrgContext` (user, organization, role, permissions) | Medium |
+| 4 | `api/auth/dependencies.py` — `get_org_context` resolution from path param | High |
+| 5 | `api/auth/rbac.py` — `require(Permission)` route dependency, default deny | High |
+| 6 | Organization-scoped base repository (mandatory `organization_id` filter) | High |
+| 7 | Retrofit all repositories onto the scoped base | Medium |
+| 8 | Admin range enforcement — counter column, `CHECK`, trigger + migration | High |
+| 9 | `super_admin` bypass — explicit argument, read-only, audit record | High |
+| 10 | Move organization-owned routes under `/orgs/{organization_id}/` | Medium |
+| 11 | Cross-tenant isolation test suite (adversarial: guessed IDs, stale tokens) | High |
+| 12 | RBAC test suite — every role against every permission, plus default-deny | High |
 
-**In plain words:** Multiple companies use the same running application, and none of them may ever see another's data. The `Tenant` model already exists from Phase 3; this phase adds organizations and membership, then makes isolation *structural*.
+**In plain words:** Phase 3 created the tables and Phase 4 established who the caller
+is. This phase decides what they are allowed to do, and makes it impossible to
+accidentally serve one organization's data to another.
 
-**3. Tenant middleware.** Works out which company the request belongs to, once, at the entrance, and makes it available everywhere downstream.
+**1. Membership lifecycle.** Inviting someone creates a `pending` membership;
+accepting flips it to `active`; removal sets `suspended` rather than deleting the row,
+because audit records point at it. Only `active` grants anything.
 
-**4–5. Mandatory filtering.** The critical design idea: make it *impossible* to write a query that forgets the tenant filter, rather than relying on developers remembering. One forgotten `WHERE tenant_id = ?` is a full data breach. Building the filter into the base repository means every query inherits it by default.
+**2. Permission matrix.** The list of every action in the system (`document:delete`,
+`member:invite`, …) and which role holds each. A constant in code, not a database
+table — with two fixed roles a `role_permissions` join buys nothing and hides the
+permission set from code review. The trigger for moving it into the database is
+recorded in architecture §7.6: the first customer who needs a role the platform does
+not define.
 
-**6. Adversarial tests.** Not "does it work" but "can I break in" — log in as company A, guess company B's document IDs, and confirm you get denied every time. This is the single most important test suite in the project.
+**3. `OrgContext`.** One object carrying everything an authorization decision needs:
+who, which organization, what role, which permissions. Built once at the entrance so
+no service has to re-derive it.
 
-**7. RBAC.** Beyond which company you belong to: what are you allowed to do inside it? Admins delete, viewers read. A scaffold now avoids retrofitting permissions across every endpoint later.
+**4. Context resolution.** Reads `organization_id` from the URL, loads the membership,
+rejects anything that is not `active`. A client-supplied organization id is a lookup
+key, never proof of access. Absent membership returns **404, not 403** — a 403 confirms
+the organization exists and leaks the tenant id space to anyone probing.
+
+**5. `require(Permission)`.** The dependency a route declares to state what it needs.
+The important property is what happens when a developer forgets: the default is deny,
+so the endpoint locks and someone files a bug, rather than opening silently.
+
+**6–7. Mandatory filtering.** The critical design idea: make it *impossible* to write a
+query that forgets the organization filter, rather than relying on developers
+remembering. One missing `WHERE organization_id = ?` is a full data breach. The filter
+is built into the base repository, so every query inherits it, and crossing tenants
+requires calling a differently-named method that logs why.
+
+**8. Admin range.** Every organization keeps between one and `max_admins` (default 2)
+active admins. Both ends matter — a cap alone lets the last admin demote themselves and
+strand the organization with nobody who can manage it. Enforced with a counter column
+and a `CHECK` on `organizations`, maintained by a trigger. A trigger that instead ran
+`SELECT count(*)` would be racy under concurrent writes; architecture §7.7 has the
+reason. The service checks first purely so the user sees a `409` rather than a `500`.
+
+**9. `super_admin` bypass.** A platform operator must be able to read across tenants
+for support. That hole has to be explicit (a named argument at the call site, never a
+hidden branch inside the repository), audited (who read what, when, and why), and
+read-only. An unaudited bypass is exactly what task 11 exists to catch.
+
+**10. Route restructuring.** Organization-owned resources move under
+`/api/v1/orgs/{organization_id}/…`, so the tenant is visible in the URL, in access
+logs, and in traces. An ambient tenant that appears nowhere in the request is hard to
+audit after an incident.
+
+**11. Adversarial tests.** Not "does it work" but "can I break in" — log in as
+organization A, guess organization B's document ids, replay a token issued before a
+membership was revoked, pass another organization's id in the path. Every one must be
+denied. This is the single most important test suite in the project.
+
+**12. RBAC tests.** A matrix test: every role against every permission, asserting the
+matrix, plus a test that a route with no declared permission denies everyone. The
+second half is what stops the default-deny guarantee from quietly regressing.
 
 ---
 
@@ -177,7 +238,7 @@ Every task includes a plain-language description of what it does and why it matt
 | 7 | `api/services/document_service.py` | Medium |
 | 8 | `api/routes/v1/documents.py` — upload/list/delete/download/metadata | Medium |
 | 9 | Multipart upload handling + streaming to storage | High |
-| 10 | Tenant isolation on all document endpoints | Medium |
+| 10 | Organization isolation on all document endpoints | Medium |
 
 **1–2. Storage interface + implementation.** Files don't go in the database — they go to cloud object storage. You define an interface first so the rest of the app never knows or cares which provider you use, and swapping providers later touches one file.
 
@@ -350,7 +411,7 @@ Every task includes a plain-language description of what it does and why it matt
 | # | Task | Difficulty |
 |---|---|---|
 | 1 | `shared/vector_store/base.py` — `VectorStore` interface | Low |
-| 2 | Payload schema design (tenant_id, document_id, version_id, page, etc.) | Medium |
+| 2 | Payload schema design (organization_id, document_id, version_id, page, etc.) | Medium |
 | 3 | Collection/index configuration | High |
 | 4 | `qdrant.py` impl (upsert/search/delete/filter) | Medium |
 | 5 | Metadata filter integration with vector query | High |
@@ -583,7 +644,7 @@ Every task includes a plain-language description of what it does and why it matt
 
 | # | Task | Difficulty |
 |---|---|---|
-| 1 | Structured log fields standardization (request_id, tenant_id, operation, duration, status) | Medium |
+| 1 | Structured log fields standardization (request_id, user_id, organization_id, operation, duration, status) | Medium |
 | 2 | OpenTelemetry instrumentation (traces across auth→query→retrieval→LLM) | High |
 | 3 | Span-level safe metadata (no secrets/full doc content) | Medium |
 | 4 | Prometheus metrics export | Medium |
@@ -611,7 +672,7 @@ Every task includes a plain-language description of what it does and why it matt
 
 **1. Redirect revalidation.** A URL can pass your safety check and then redirect to a blocked internal address. Every hop must be re-checked, not just the first.
 
-**2. RBAC audit.** Systematically verify every endpoint actually enforces permissions. Endpoints get added over many phases; some will have been missed.
+**2. RBAC audit.** Systematically verify every endpoint actually enforces permissions and sits under the right scope. Endpoints get added over many phases; some will have been missed. Enumerate every registered route and assert three things: it declares a required permission, organization-owned routes live under `/orgs/{organization_id}/`, and their queries go through the organization-scoped repository. Default deny means a missed route fails closed rather than leaking — this audit is how you find out it happened.
 
 **3. Rate limiting.** Cap how often one user can call you. Without it, a single client can exhaust your AI provider budget in minutes.
 

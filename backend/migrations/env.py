@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 # env.py is run by the alembic CLI, not by the app, so src/ is not on the import path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import api.models  # noqa: E402,F401  — registers every model in Base.metadata
 from api.config.settings import get_settings  # noqa: E402
 from api.db.base import Base  # noqa: E402
 

@@ -764,7 +764,7 @@ A canonical document might conceptually contain:
 ```text
 Document
  ├── id
- ├── tenant_id
+ ├── organization_id
  ├── version
  ├── source
  ├── metadata
@@ -936,7 +936,7 @@ This improves retrieval because the embedding receives more semantic context.
 Each chunk should have metadata such as:
 
 ```text
-tenant_id
+organization_id
 document_id
 document_version_id
 chunk_id
@@ -1038,7 +1038,7 @@ A conceptual record:
 {
     vector: [...],
     payload: {
-        tenant_id: "...",
+        organization_id: "...",
         document_id: "...",
         chunk_id: "...",
         page: 12,
@@ -1485,7 +1485,7 @@ Examples:
 Examples:
 
 - Conversation ID
-- Tenant ID
+- Organization ID
 - User ID
 - Created time
 
@@ -1501,42 +1501,169 @@ This controls context size and cost.
 
 ---
 
-# 36. Multi-Tenancy
+# 36. Multi-Tenancy and RBAC
 
-Every important database and search operation should be tenant-aware.
-
-Conceptually:
-
-```text
-Tenant
- ├── Users
- ├── Documents
- ├── Versions
- ├── Chunks
- ├── Conversations
- └── Evaluations
-```
-
-A request should carry:
+Two questions have to be answered on every request, and they are not the same
+question:
 
 ```text
-tenant_id
-user_id
+Isolation      which organization's data is this?     → organization_id
+Authorization  is this person allowed to do it?       → role → permission
 ```
 
-Every query must enforce tenant boundaries.
+Getting the first wrong leaks one customer's documents to another. Getting the second
+wrong lets any employee delete their company's knowledge base. Both layers are
+mandatory, and neither covers for the other.
 
-For example:
+## The three entities
 
 ```text
-SELECT *
-FROM documents
-WHERE tenant_id = current_tenant
+User ──────< Membership >────── Organization
 ```
 
-The same isolation must exist in vector search.
+**`User`** is a global identity: one human, one login. It has no role column and no
+organization column.
 
-Never rely only on frontend filtering.
+**`Organization`** is a tenant — a company, a team, or one person's private workspace.
+
+**`Membership`** joins them, and carries everything about standing inside that
+organization:
+
+```text
+role          admin | member
+account_type  member | guest | service
+status        pending | active | suspended
+```
+
+## Why the role is on the membership
+
+The instinct is to put `role` on the user. It breaks the first time someone belongs to
+two organizations.
+
+A consultant is an admin at their own company and an ordinary member at a client's. A
+single `User.role` forces one answer for both, so you end up either duplicating the
+person into two accounts with two passwords, or accepting that their role is wrong in
+one of the two places.
+
+The role is not a fact about the person. It is a fact about the *relationship* between
+the person and one organization. So it is stored on the relationship.
+
+Practical consequence: there is no such thing as "this user's role" in this system. The
+lookup is always `(user_id, organization_id)`, and asking without an organization is a
+malformed question.
+
+## People with no company
+
+Not every user belongs to an organization in the ordinary sense. Someone can sign up
+alone and use the platform privately.
+
+The tempting design is to let those users own documents directly — `organization_id`
+nullable, `owner_id` filled in instead. It is a trap. Every query in the system then
+becomes:
+
+```text
+WHERE organization_id = :org
+   OR (organization_id IS NULL AND owner_id = :user)
+```
+
+and the entire safety strategy is a base repository that automatically appends the
+organization filter. It cannot automatically append a correct disjunction. One
+developer writing the simple version of that query is a data breach.
+
+So instead: **every user gets an organization at signup.** A solo user's is a personal
+organization — `kind = 'personal'`, one member, that member is its admin. A company's
+is `kind = 'team'`.
+
+Nothing else in the system needs to know the difference. `organization_id` is `NOT
+NULL` everywhere, every query filters on one column with one value, and "turn my
+personal workspace into a team" is an invitation rather than a data migration.
+
+The cost is three rows at signup instead of one. That is a good trade for deleting an
+entire category of leak.
+
+## Roles
+
+| Role | Scope | Where it lives |
+|---|---|---|
+| `admin` | One organization | `Membership.role` |
+| `member` | One organization | `Membership.role` |
+| `super_admin` | The whole platform | `User.is_super_admin` |
+
+`super_admin` is the exception that proves the rule. A platform operator doing support
+has no home organization, so the flag genuinely is a property of the human. It is also
+a deliberate hole in tenant isolation, which is why it is explicit at every call site,
+read-only, and audited every time it is used.
+
+Broadly: `admin` manages the organization — invites people, changes roles, deletes
+documents, reads the audit log. `member` does the actual work — uploads, searches,
+asks questions, reads. The full matrix is in `architecture.md` §7.6.
+
+## account_type is not a role
+
+`account_type` records how a seat is classified for billing: a regular `member` seat, a
+restricted `guest`, or a `service` seat behind an API key.
+
+It never participates in an authorization decision. Only `role` does.
+
+This is worth stating as a rule because two fields that both look like "what kind of
+user is this" reliably drift into two competing permission systems, and every
+authorization bug after that begins with someone asking which of the two was supposed
+to win. If a distinction needs to change what somebody can do, it belongs in `role`.
+
+## At most two admins, and at least one
+
+Each organization is capped at two active admins — stored as `max_admins`, defaulting
+to 2, so the number can change per customer without a code release.
+
+The less obvious half is the floor. A cap by itself lets an organization reach *zero*
+admins: the last admin demotes themselves or leaves, and from that moment nobody can
+invite anyone, change any role, or delete anything. The organization is bricked and
+only a platform operator can rescue it. So the rule is a range, one to `max_admins`,
+and every operation that could move the count is checked against both ends.
+
+It is enforced in the database, not only in service code — a counter column with a
+`CHECK` constraint, maintained by a trigger. Service code can be bypassed by a second
+service, a background worker, or someone typing SQL during an incident. A constraint
+cannot.
+
+## What a request actually does
+
+```text
+token          → user_id
+URL path       → organization_id
+membership     → role, or 404 if there is no active membership
+role           → permission set
+route          → the permission it declared
+repository     → WHERE organization_id = :ctx.organization_id, always
+```
+
+Two details in there carry more weight than they look like they do.
+
+**No membership returns 404, not 403.** A 403 says "this exists, you may not have it" —
+which confirms to anyone probing that the organization id is real. 404 says nothing.
+403 is used only once membership is already established and it is the *role* that is
+insufficient, where the caller already knows the organization exists.
+
+**The role is not in the token.** It is looked up per request and cached briefly in
+Redis. If the role travelled in the JWT, revoking someone's admin rights would not take
+effect until their token expired — which would defeat both the admin cap and membership
+suspension.
+
+## The filter is structural
+
+```text
+SELECT * FROM documents WHERE organization_id = :ctx.organization_id
+```
+
+The point is not that this line is correct. It is that no developer ever writes it.
+The organization-scoped base repository injects it into every query, so the filter is
+inherited rather than remembered, and a cross-tenant query requires deliberately
+calling a differently-named method that records why.
+
+The same isolation applies to vector search: the organization filter goes into the
+Qdrant query, not applied to the results afterwards.
+
+Never rely on frontend filtering for any of this.
 
 ---
 
@@ -1667,7 +1794,8 @@ PostgreSQL is the source of truth for application state.
 Store:
 
 - Users
-- Tenants
+- Organizations
+- Memberships (role, account_type, status — the authorization table)
 - Documents
 - Document versions
 - Ingestion jobs
@@ -1723,6 +1851,18 @@ The actual large binary data lives in object storage.
 
 # 44. API Design
 
+Routes fall into three scopes, and the scope is visible in the URL:
+
+```text
+/api/v1/auth/*                        identity, no organization
+/api/v1/me/*                          the caller, across organizations
+/api/v1/orgs/{organization_id}/*      organization-scoped, membership required
+```
+
+Putting the organization in the path rather than in a header or a token claim means
+the tenant shows up in access logs, traces, and tests. An ambient tenant that appears
+nowhere in the request is very hard to audit after an incident.
+
 Example APIs:
 
 ## Authentication
@@ -1731,30 +1871,54 @@ Example APIs:
 POST /auth/login
 POST /auth/register
 POST /auth/refresh
+POST /auth/logout
+```
+
+## The caller
+
+```text
+GET   /me
+GET   /me/organizations          organizations this user belongs to
+POST  /me/organizations          create a team organization
+GET   /me/invitations
+POST  /me/invitations/{id}/accept
+```
+
+## Organization and members
+
+```text
+GET    /orgs/{org_id}
+PATCH  /orgs/{org_id}                        admin
+DELETE /orgs/{org_id}                        admin
+GET    /orgs/{org_id}/members
+POST   /orgs/{org_id}/members/invite         admin
+PATCH  /orgs/{org_id}/members/{user_id}      admin — role change, admin range checked
+DELETE /orgs/{org_id}/members/{user_id}      admin — suspends, never hard-deletes
+GET    /orgs/{org_id}/audit                  admin
 ```
 
 ## Documents
 
 ```text
-POST   /documents
-GET    /documents
-GET    /documents/{id}
-DELETE /documents/{id}
-POST   /documents/{id}/reprocess
+POST   /orgs/{org_id}/documents
+GET    /orgs/{org_id}/documents
+GET    /orgs/{org_id}/documents/{id}
+DELETE /orgs/{org_id}/documents/{id}         admin
+POST   /orgs/{org_id}/documents/{id}/reprocess
 ```
 
 ## Jobs
 
 ```text
-GET /jobs/{id}
+GET /orgs/{org_id}/jobs/{id}
 ```
 
 ## Chat
 
 ```text
-POST /conversations
-GET  /conversations
-POST /conversations/{id}/messages
+POST /orgs/{org_id}/conversations
+GET  /orgs/{org_id}/conversations
+POST /orgs/{org_id}/conversations/{id}/messages
 ```
 
 ## Search
@@ -2121,9 +2285,27 @@ Use secure authentication.
 
 Users should access only resources they are permitted to access.
 
+Role-based, with the role stored on the membership rather than on the user, so the
+same person can be an admin in one organization and an ordinary member in another.
+Every route declares the permission it needs and the default is deny, so a route
+somebody forgot to annotate locks itself instead of opening. Roles are resolved per
+request rather than read from the token, so revoking someone's access takes effect on
+their next call rather than when their token happens to expire.
+
+`account_type` is billing metadata and never enters an authorization decision.
+
 ## Tenant isolation
 
-Every retrieval operation must enforce tenant boundaries.
+Every retrieval operation must enforce organization boundaries.
+
+Every organization-owned table carries `organization_id NOT NULL`, and the filter is
+injected by the base repository rather than written by hand, so a query cannot omit it
+by accident. The same filter goes into the vector search itself, not applied to its
+results afterwards.
+
+A user with no active membership in an organization gets `404` — `403` would confirm
+the organization exists. Platform operators can read across organizations, but only
+through an explicit argument, only for reads, and every such access is audited.
 
 ## File validation
 
@@ -2195,7 +2377,7 @@ Rate limits can exist at multiple levels:
 ```text
 IP
 User
-Tenant
+Organization
 API key
 Endpoint
 ```
@@ -2664,11 +2846,12 @@ Goal:
 Build:
 
 - User model
-- Tenant model
+- Organization model
+- Membership model (role, account_type, status)
 - Login
 - Sessions/tokens
-- Authorization
-- Tenant middleware
+- RBAC: permission matrix, default-deny route guards
+- Organization context resolution
 
 Goal:
 

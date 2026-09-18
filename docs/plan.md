@@ -322,7 +322,8 @@ backend/
 │   │   │   └── v1/
 │   │   │       ├── auth.py
 │   │   │       ├── users.py
-│   │   │       ├── tenants.py
+│   │   │       ├── organizations.py
+│   │   │       ├── memberships.py
 │   │   │       ├── documents.py
 │   │   │       ├── document_versions.py
 │   │   │       ├── ingestion_jobs.py
@@ -333,10 +334,12 @@ backend/
 │   │   │       └── health.py
 │   │   │
 │   │   ├── auth/
-│   │   │   ├── dependencies.py
+│   │   │   ├── dependencies.py       # get_current_user, get_org_context
 │   │   │   ├── jwt.py
 │   │   │   ├── password.py
-│   │   │   └── permissions.py
+│   │   │   ├── permissions.py        # Permission enum + role→permission matrix
+│   │   │   ├── rbac.py               # require(Permission) route dependency
+│   │   │   └── context.py            # OrgContext dataclass
 │   │   │
 │   │   ├── config/
 │   │   │   ├── settings.py
@@ -348,7 +351,8 @@ backend/
 │   │   │   │
 │   │   │   ├── models/
 │   │   │   │   ├── user.py
-│   │   │   │   ├── tenant.py
+│   │   │   │   ├── organization.py
+│   │   │   │   ├── membership.py
 │   │   │   │   ├── document.py
 │   │   │   │   ├── document_version.py
 │   │   │   │   ├── chunk.py
@@ -357,15 +361,19 @@ backend/
 │   │   │   │   └── message.py
 │   │   │   │
 │   │   │   └── repositories/
+│   │   │       ├── base.py           # unscoped base
+│   │   │       ├── org_scoped.py     # mandatory organization_id filter
 │   │   │       ├── users.py
-│   │   │       ├── tenants.py
+│   │   │       ├── organizations.py
+│   │   │       ├── memberships.py
 │   │   │       ├── documents.py
 │   │   │       └── conversations.py
 │   │   │
 │   │   ├── schemas/
 │   │   │   ├── auth.py
 │   │   │   ├── users.py
-│   │   │   ├── tenants.py
+│   │   │   ├── organizations.py
+│   │   │   ├── memberships.py
 │   │   │   ├── documents.py
 │   │   │   ├── ingestion.py
 │   │   │   ├── search.py
@@ -374,13 +382,15 @@ backend/
 │   │   │
 │   │   ├── services/
 │   │   │   ├── auth_service.py
+│   │   │   ├── organization_service.py
+│   │   │   ├── membership_service.py   # invite, accept, role change, admin cap
 │   │   │   ├── document_service.py
 │   │   │   ├── conversation_service.py
 │   │   │   └── evaluation_service.py
 │   │   │
 │   │   ├── middleware/
 │   │   │   ├── request_id.py
-│   │   │   ├── tenant.py
+│   │   │   ├── org_context.py
 │   │   │   ├── rate_limit.py
 │   │   │   └── security.py
 │   │   │
@@ -700,7 +710,8 @@ The AI layer must use provider abstractions so models can be swapped without rew
 Used for:
 
 * Users
-* Tenants
+* Organizations
+* Memberships
 * Documents
 * Document versions
 * Chunks
@@ -803,38 +814,100 @@ Qdrant
 
 # Phase 2 — Authentication
 
+Identity only. This phase establishes *who* the caller is. It does not decide what
+they may do — that is Phase 3.
+
 Implement:
 
-* User registration
+* User registration — creates `User`, a personal `Organization`, and the owning
+  `Membership` in one transaction (see Phase 3 and architecture §7.3)
 * Login
 * Password hashing
-* JWT
-* Access tokens
+* JWT access tokens — carrying `user_id` only, never a role
 * Refresh tokens
-* Logout
-* Authentication middleware
+* Logout and token revocation
+* Authentication middleware / `get_current_user`
+
+The access token deliberately carries **no role and no organization**. A role baked
+into a token stays valid until the token expires, which would mean a demotion or a
+suspended membership takes minutes to apply. Authority is resolved per request in
+Phase 3.
 
 ---
 
-# Phase 3 — Multi-Tenancy
+# Phase 3 — Multi-Tenancy and RBAC
 
-Implement:
+Implement the identity and tenancy model defined in architecture §7.
+
+## Data model
 
 ```text
-User
-  ↓
-Tenant
-  ↓
-Documents
-  ↓
-Chunks
-  ↓
-Conversations
+User ──────< Membership >────── Organization
+                 │
+                 ├── role            admin | member
+                 ├── account_type    member | guest | service
+                 └── status          pending | active | suspended
+                        │
+                        ▼
+              Documents, Versions, Chunks,
+              Conversations, Messages, Evaluations
+              (every one carries organization_id NOT NULL)
 ```
 
-Every tenant-owned resource must have tenant isolation.
+* `User` is the global identity — one human, one credential, no role column.
+* `Organization` is the tenant. `kind` is `personal` or `team`.
+* `Membership` links them and is the only place organization authority is stored.
+* A user may hold memberships in many organizations, with a different role in each.
+* A user working alone has a `personal` organization, so there is never a row without
+  an `organization_id`.
 
-Never rely solely on frontend filtering for tenant security.
+## Roles
+
+| Role | Scope | Stored on |
+|---|---|---|
+| `admin` | One organization | `Membership.role` |
+| `member` | One organization | `Membership.role` |
+| `super_admin` | Platform-wide | `User.is_super_admin` |
+
+Roles are never stored on `User` except `is_super_admin`, which is not an
+organization role. The full permission matrix is in architecture §7.6.
+
+## The two-admin rule
+
+Every organization holds **at least one and at most `max_admins` (default 2)** active
+admins. Both ends are enforced — a cap alone lets an organization reach zero admins
+and become permanently unmanageable.
+
+Enforcement is at the database level: a counter column on `organizations` with a
+`CHECK` constraint, maintained by a trigger on `memberships`. The service layer checks
+first only so the user gets a `409` instead of a `500`. Architecture §7.7 explains why
+a counting trigger would be racy and a counter column is not.
+
+## Isolation
+
+Every organization-owned resource is scoped by `organization_id`, and the filter is
+injected by the base repository rather than written by hand at each call site. One
+forgotten `WHERE` is a cross-tenant breach.
+
+Authorization and isolation are separate layers and both are mandatory:
+
+```text
+Authorization   may this role perform this action?     route / service, default deny
+Isolation       is this row inside my organization?    repository, always applied
+```
+
+Never rely on frontend filtering for either.
+
+## Routing
+
+```text
+/api/v1/auth/*                        identity
+/api/v1/me/*                          the caller, across organizations
+/api/v1/orgs/{organization_id}/*      organization-scoped, membership required
+```
+
+A client-supplied `organization_id` is a lookup key for a membership check, never an
+assertion of access. No active membership returns `404`, not `403`.
 
 ---
 
@@ -1016,7 +1089,7 @@ page_number
 section
 heading
 source
-tenant_id
+organization_id
 content
 ```
 
@@ -1078,7 +1151,7 @@ filter
 Support metadata filters:
 
 ```text
-tenant_id
+organization_id
 document_id
 document_version_id
 source
@@ -1508,11 +1581,30 @@ JWT.
 
 ### Authorization
 
-Role-based access control.
+Role-based access control, as defined in architecture §7.6.
+
+* Roles live on `Membership`, never on `User`, so the same person can be `admin` in
+  one organization and `member` in another.
+* Every route declares the permission it requires. A route declaring nothing denies
+  all access — the default is deny, so a forgotten declaration produces a locked
+  endpoint rather than a silent hole.
+* Roles and permissions are resolved per request, not read from the token, so
+  demotion and suspension take effect immediately.
+* `account_type` is billing metadata and is never an authorization input.
+* The one-to-`max_admins` admin range is enforced by a database constraint, not only
+  by service code.
 
 ### Multi-tenant isolation
 
-Users must only access their tenant's data.
+Users must only access their organization's data.
+
+* Every organization-owned table carries `organization_id NOT NULL`.
+* The filter is injected by the base repository, so a query cannot omit it by
+  accident.
+* `super_admin` may bypass it only through an explicit named argument, only for
+  reads, and every bypass writes an audit record (architecture §7.10).
+* Absent membership returns `404`; insufficient role returns `403`. The distinction
+  keeps the tenant id space from leaking to probes.
 
 ### File security
 
@@ -1962,7 +2054,11 @@ The project is considered complete when:
 
 * FastAPI APIs work
 * Authentication works
-* Multi-tenancy works
+* Multi-tenancy works — `organization_id NOT NULL` everywhere, repository-injected
+* RBAC works — per-membership roles, declared route permissions, default deny
+* Admin range (1 to `max_admins`) enforced by database constraint
+* Cross-tenant adversarial test suite passes
+* `super_admin` bypass is explicit, read-only, and audited
 * Async ingestion works
 * OCR works
 * Parsing works

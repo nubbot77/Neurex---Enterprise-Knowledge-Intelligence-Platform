@@ -51,7 +51,7 @@ For queries:
 ```text
 User Query
  ↓
-Authentication + Tenant Context
+Authentication + Organization Context
  ↓
 Query Analysis
  ↓
@@ -256,6 +256,19 @@ app/
 └── main.py
 ```
 
+Routes divide into three scopes, and the scope is visible in the URL:
+
+```text
+/api/v1/auth/*                        unauthenticated or identity-only
+/api/v1/me/*                          authenticated, no organization context
+/api/v1/orgs/{organization_id}/*      authenticated, organization-scoped
+```
+
+Everything under `/orgs/{organization_id}/` resolves an organization context before the
+handler runs, and every query it issues is filtered by that organization. Section 7.8
+defines the resolution; section 7.9 defines why the filter lives in the repository
+rather than in the route.
+
 The route should not contain the entire business workflow.
 
 Conceptually:
@@ -265,11 +278,17 @@ HTTP Request
  ↓
 Route
  ↓
+Authentication            → user_id
+ ↓
+Organization context      → membership, role, permissions
+ ↓
+Permission check          → declared by the route, default deny
+ ↓
 Validation
  ↓
 Service
  ↓
-Repository / external provider
+Repository (organization filter injected) / external provider
  ↓
 Response schema
 ```
@@ -309,50 +328,387 @@ Use PostgreSQL for:
 - conversation state
 - evaluation state
 
+Every table above except `users` and `organizations` carries a `NOT NULL`
+`organization_id`. There are no exceptions and no nullable ownership column — see
+section 7.3 for why solo users get a personal organization rather than a second
+ownership path.
+
+`memberships` is the authorization table. It is read on every organization-scoped
+request, so `(user_id, organization_id)` is a unique index, not merely a constraint.
+
 Do not store original PDFs in PostgreSQL.
 
 ---
 
-# 7. Tenant Model
+# 7. Identity, Tenancy, and Access Control
 
-Core relationship:
+This section defines the identity model, the tenant model, and the RBAC rules that
+govern every authorization decision in the system. It supersedes the earlier
+"User → Tenant" sketch.
 
-```text
-Organization
-    │
-    ├── Members
-    ├── Documents
-    ├── Conversations
-    └── Evaluation datasets
-```
+## 7.1 Three entities
 
-Every tenant-scoped entity should be associated with an organization.
-
-Conceptually:
+| Entity | Represents | Lifetime |
+|---|---|---|
+| `User` | A global identity — one human, one login credential | Independent of any organization |
+| `Organization` | A tenant: a company, team, or a single person's private workspace | Independent of any user |
+| `Membership` | The link between the two, and the place where authority lives | Exists only while the user belongs to the organization |
 
 ```text
-organization_id
+User ──────< Membership >────── Organization
+(global identity)    (role, account_type, status)    (tenant boundary)
 ```
 
-must flow through:
+`Membership` is not a plain join table. It carries the three facts that authorization
+depends on:
+
+| Column | Meaning |
+|---|---|
+| `role` | What this user may do **inside this organization** |
+| `account_type` | How this seat is classified for billing and reporting. **Never consulted for authorization.** |
+| `status` | Whether this membership is currently in force |
+
+## 7.2 Why role lives on the membership
+
+A user may belong to several organizations at once, with a different standing in each:
+admin at Acme, ordinary member at Globex. A `role` column on `User` cannot express
+that — it forces one role per human, which means either duplicating the person as two
+accounts or accepting that the role is wrong in one of the organizations.
+
+The authority is a property of the *relationship*, not of the person. So it lives on
+the relationship.
+
+Consequence for every authorization check in the system: the role lookup is always
+keyed by the pair `(user_id, organization_id)`. There is no such thing as "the user's
+role" without an organization in the question.
+
+## 7.3 Individual users — the personal organization
+
+A user may sign up and work alone, with no company. The system supports this without
+introducing a second ownership path.
+
+**Every user gets an organization at signup.** For a solo user it is a personal
+organization: `Organization.kind = 'personal'`, exactly one member, that member holding
+`admin`. A company workspace is `kind = 'team'`.
+
+```text
+kind = 'personal'    one member, cannot receive invitations
+kind = 'team'        many members, invitations, role management
+```
+
+The alternative — letting organization-owned rows carry a nullable `organization_id`
+and fall back to a `user_id` owner column — was rejected. It would mean every
+tenant-scoped query becomes:
+
+```text
+WHERE organization_id = :org
+   OR (organization_id IS NULL AND owner_id = :user)
+```
+
+That `OR` is exactly the clause a developer forgets, and forgetting it is a
+cross-tenant data leak. Section 7.9's mandatory-filter repository cannot defend a rule
+it has to express as a disjunction.
+
+With personal organizations:
+
+- `organization_id` is `NOT NULL` on every tenant-scoped table, with no exceptions
+- every query filters on one column, with one value
+- the isolation invariant the adversarial test suite checks is a single statement
+- "upgrade my personal workspace to a team" is a `kind` change plus invitations, not a
+  data migration
+
+Cost: signup writes three rows in one transaction (`User`, `Organization`,
+`Membership`) instead of one. That is the whole price.
+
+## 7.4 Membership status
+
+```text
+pending      invited, invitation not yet accepted
+active       in force
+suspended    retained for audit and restoration, grants nothing
+```
+
+**Only `active` grants anything.** A `pending` or `suspended` membership resolves to
+zero permissions. This is checked once, during organization context resolution (7.8),
+not repeated at each call site.
+
+Removal from an organization is a `status` transition, not a row delete — audit records
+reference the membership, and deleting it would orphan that history.
+
+## 7.5 account_type
+
+`account_type` classifies the seat for billing and reporting:
+
+```text
+member       a regular seat, counted against the organization's plan
+guest        external collaborator, restricted seat
+service      non-human seat backing an API key or integration
+```
+
+**Rule: `account_type` carries no permissions.** It never appears in an authorization
+decision. Only `role` does.
+
+This rule exists because two attributes that both read as "what kind of user is this"
+will otherwise drift into two overlapping permission systems, and every authorization
+bug afterwards starts with "which of the two was supposed to win?" If a distinction
+genuinely needs to change what someone may do, it belongs in `role`.
+
+## 7.6 Roles and permissions
+
+Three roles exist. Two are organization-scoped, one is not.
+
+| Role | Scope | Stored on |
+|---|---|---|
+| `admin` | One organization | `Membership.role` |
+| `member` | One organization | `Membership.role` |
+| `super_admin` | Platform-wide, no organization | `User.is_super_admin` |
+
+`super_admin` is not a membership role. A platform operator has no home organization;
+the flag is a fact about the human. Its bypass rules are in 7.10.
+
+### Permission catalogue
+
+Permissions are named `resource:action`:
+
+```text
+org:read             org:update           org:delete
+member:invite        member:read          member:update_role      member:remove
+document:create      document:read        document:update         document:delete
+document:reprocess
+conversation:create  conversation:read    conversation:delete
+search:execute
+evaluation:create    evaluation:read      evaluation:run
+apikey:create        apikey:read          apikey:revoke
+audit:read
+```
+
+### Role to permission matrix
+
+| Permission | `admin` | `member` |
+|---|:--:|:--:|
+| `org:read` | yes | yes |
+| `org:update` | yes | no |
+| `org:delete` | yes | no |
+| `member:invite` | yes | no |
+| `member:read` | yes | yes |
+| `member:update_role` | yes | no |
+| `member:remove` | yes | no |
+| `document:create` | yes | yes |
+| `document:read` | yes | yes |
+| `document:update` | yes | yes |
+| `document:delete` | yes | no |
+| `document:reprocess` | yes | yes |
+| `conversation:create` | yes | yes |
+| `conversation:read` | yes | own only |
+| `conversation:delete` | yes | own only |
+| `search:execute` | yes | yes |
+| `evaluation:create` | yes | no |
+| `evaluation:read` | yes | yes |
+| `evaluation:run` | yes | no |
+| `apikey:create` | yes | no |
+| `apikey:read` | yes | no |
+| `apikey:revoke` | yes | no |
+| `audit:read` | yes | no |
+
+"own only" is a resource-level rule, not a role-level one: the permission is granted,
+then the service additionally checks `resource.created_by == user_id`. Role checks and
+ownership checks are separate steps and neither replaces the other.
+
+### Where the matrix lives
+
+The matrix is a **constant in application code**, not rows in a database table.
+
+Rationale: with a fixed set of two organization roles, a `roles` / `permissions` /
+`role_permissions` schema adds a join to every request and buys nothing a dictionary
+does not. It also makes the permission set invisible to code review and to type
+checking.
+
+Migration trigger, recorded so the decision is revisited deliberately rather than
+argued about: **the first time a customer needs a role the platform does not define**,
+the matrix moves into the database as organization-scoped custom roles, and the
+built-in roles become seeded rows. Until then it stays in code.
+
+## 7.7 The two-admin rule
+
+An organization has **at least one and at most two** `admin` memberships in `active`
+status.
+
+The maximum is stored as `Organization.max_admins`, defaulting to `2`. It is a column,
+not a literal, so a plan change is an `UPDATE` rather than a migration plus a code
+release. The minimum of one is a fixed invariant.
+
+### Why the minimum matters as much as the maximum
+
+A cap alone allows an organization to reach zero admins — the last admin demotes
+themselves, or removes their own membership, and nobody can invite, manage roles, or
+delete anything ever again. The organization is stuck, and only a platform operator can
+rescue it.
+
+So both ends are enforced. An operation is rejected if it would:
+
+- raise active admins above `max_admins`, or
+- drop active admins below one
+
+This covers role changes, membership removal, membership suspension, and a user leaving
+voluntarily — every one of them can move the count.
+
+### Enforcement: two layers
+
+**Layer 1 — database, authoritative.** `Organization.active_admin_count` is a
+maintained counter with:
+
+```text
+CHECK (active_admin_count BETWEEN 1 AND max_admins)
+```
+
+A trigger on `Membership` insert, update, and delete adjusts the counter on the parent
+organization row.
+
+This is correct under concurrency for a specific reason worth stating, because the
+obvious alternative is not. A trigger that runs `SELECT count(*) FROM memberships ...`
+is **racy**: two concurrent transactions each see a snapshot that excludes the other's
+uncommitted row, both count one admin, both insert, and the organization ends with
+three. An `UPDATE organizations SET active_admin_count = active_admin_count + 1`
+instead takes a row lock on the organization; the second transaction blocks, then
+re-reads the committed value, and the `CHECK` fires. Same rule, different concurrency
+behaviour.
+
+The consequence of putting it here is that the rule cannot be bypassed — not by a
+second service, not by a worker, not by a hand-typed `INSERT` during an incident.
+
+**Layer 2 — service, for the error message.** The service checks the count first and
+returns `409 Conflict` with a usable message. Without it the user sees a constraint
+violation surfaced as a 500.
+
+Layer 2 is a courtesy. Layer 1 is the guarantee. Layer 2 alone would be a bug.
+
+### Recovery
+
+If an organization loses both admins through identity-level account deletion, a
+`super_admin` promotes a member. That path is audited like every other bypass (7.10).
+
+## 7.8 Organization context resolution
+
+Every request that touches organization-owned data resolves an organization context
+before any handler logic runs.
 
 ```text
 HTTP request
  ↓
-authenticated user
+authenticate → user_id                     (from JWT)
  ↓
-tenant context
+read requested organization_id             (from URL path)
  ↓
-service
+load membership (user_id, organization_id)
  ↓
-repository
+reject if absent or status != 'active'     → 404
  ↓
-database/vector search
+role → permission set                      (from the code matrix)
+ ↓
+OrgContext { user_id, organization_id, role, permissions, is_super_admin }
+ ↓
+service → repository → database / vector search
 ```
 
-Tenant isolation must not depend only on the frontend.
+### The organization id comes from the URL
 
-The backend must enforce it.
+Organization-scoped routes are path-scoped:
+
+```text
+/api/v1/orgs/{organization_id}/documents
+/api/v1/orgs/{organization_id}/conversations
+/api/v1/orgs/{organization_id}/members
+```
+
+The scope is then visible in the route, in access logs, in traces, and in tests. A
+header or a JWT claim hides it, and an ambient tenant that nothing in the URL records
+is hard to audit after an incident.
+
+A client-supplied `organization_id` is never trusted on its own. It is only ever a
+lookup key for the membership query above, and a user with no active membership for
+that organization is indistinguishable from a user asking about an organization that
+does not exist.
+
+### Absent membership returns 404, not 403
+
+`403 Forbidden` confirms the organization exists. That leaks the existence and the id
+space of other tenants to anyone probing. Absent membership returns `404`.
+
+`403` is reserved for the case where membership *is* established and the role is
+insufficient — there, the user already knows the organization exists, so a precise
+error is useful rather than leaky.
+
+### Role is not carried in the JWT
+
+The access token carries identity (`user_id`), not authority. Membership and role are
+resolved per request.
+
+A token that carries `role: admin` keeps saying `admin` until it expires, so a
+demotion or a removal does not take effect for the token's remaining lifetime. Since
+the point of the two-admin rule and of membership suspension is that they apply
+immediately, baking the role into the token would defeat both.
+
+The per-request lookup is cached in Redis under
+`membership:{user_id}:{organization_id}` with a short TTL, and the key is deleted
+explicitly whenever the membership row changes. Cache invalidation on write is part of
+the membership service, not an afterthought.
+
+## 7.9 Two enforcement layers, neither optional
+
+```text
+Authorization   →  "may this role perform this action?"      route / service
+Isolation       →  "is this row inside my organization?"     repository
+```
+
+They answer different questions and neither substitutes for the other:
+
+- authorization without isolation: a `member` of Acme performs a permitted read and
+  receives Globex's document, because nothing filtered the row
+- isolation without authorization: a `member` of Acme deletes Acme's documents, which
+  is correctly scoped and still wrong
+
+**Isolation is structural.** The tenant-scoped base repository injects
+`WHERE organization_id = :ctx.organization_id` into every query it issues. A query that
+omits the filter is not one a developer can write by accident, because constructing one
+requires calling a differently-named method that logs why.
+
+**Authorization is declarative.** Routes declare the permission they require. A route
+that declares nothing fails closed — the default is deny, so a forgotten declaration
+produces a locked endpoint and a bug report, not a silent hole.
+
+## 7.10 The super_admin bypass
+
+`super_admin` is a deliberate hole in tenant isolation, for platform support and
+incident response. Three rules constrain it:
+
+**Explicit.** The bypass is a named argument the caller passes consciously
+(`across_tenants=True`). It is never an implicit `if user.is_super_admin` branch inside
+the repository — a reader of the call site must be able to see that this query can
+cross tenants.
+
+**Audited.** Every cross-tenant access writes an audit row: who, which organization,
+which resource, when, and the stated reason. An unaudited bypass cannot answer "did
+anyone read this customer's data?", which is the question that actually gets asked.
+
+**Read-only.** Cross-tenant reads are support work. Cross-tenant writes have no
+legitimate use and turn one mistaken operation into damage across several customers.
+The two exceptions are admin recovery (7.7) and organization deletion, both audited
+operations of their own.
+
+## 7.11 Invariants
+
+The statements the adversarial test suite exists to falsify:
+
+1. Every tenant-scoped row has a non-null `organization_id`.
+2. No response ever contains a row whose `organization_id` differs from the request's
+   organization context, unless an audited `super_admin` bypass was used.
+3. A user with no active membership in an organization receives `404` for every route
+   scoped to it.
+4. An organization always has between one and `max_admins` active admins.
+5. `account_type` never changes the outcome of an authorization decision.
+6. A route with no declared permission requirement denies all access.
+7. Revoking or suspending a membership takes effect on the next request, not on the
+   next token expiry.
 
 ---
 
@@ -1216,7 +1572,7 @@ POST /chat
  ↓
 Authentication
  ↓
-Tenant resolution
+Organization context resolution
  ↓
 Conversation retrieval
  ↓
@@ -1440,26 +1796,47 @@ Browser
  ↓
 HTTPS
  ↓
-Authentication
+Authentication              who is this?          → user_id
  ↓
-Authorization
+Organization context        where are they?       → membership, must be active
  ↓
-Tenant Context
+Authorization               may they do this?     → role → permission, default deny
  ↓
 Service
  ↓
-Data Layer
+Data Layer                  isolation filter injected, not optional
 ```
+
+The four steps are distinct and none of them covers for another. Authentication
+without organization context lets a valid user act on a tenant they do not belong to.
+Organization context without authorization lets any member perform any action inside
+their tenant. Authorization without the data-layer filter lets a permitted action
+return another tenant's rows. Section 7.9 has the failure cases in full.
 
 Never trust:
 
-- tenant IDs supplied by clients
+- organization IDs supplied by clients — they are lookup keys for a membership check,
+  never an assertion of access
+- roles or permissions carried in a token — they go stale the moment a membership
+  changes, so they are resolved per request (7.8)
 - document IDs without authorization checks
-- citation IDs without tenant validation
+- citation IDs without organization validation
 - URL destinations
 - uploaded MIME types
+- `account_type` as an authorization input — it is billing metadata and carries no
+  permissions (7.5)
 
 All should be validated server-side.
+
+Authorization rules that hold across every endpoint:
+
+| Rule | Consequence of breaking it |
+|---|---|
+| A route with no declared permission denies all access | A forgotten declaration locks an endpoint instead of opening one |
+| No active membership returns `404`, not `403` | `403` confirms the organization exists and leaks the tenant id space |
+| Insufficient role returns `403` | Membership is already established, so precision is safe and useful |
+| Every cross-tenant `super_admin` read is audited | Otherwise "did anyone read this customer's data?" is unanswerable |
+| Cross-tenant writes are refused outright | One mistaken operation would damage several customers at once |
 
 ---
 
@@ -1726,7 +2103,7 @@ FastAPI
  │
  ├── Authentication
  ├── Authorization
- └── Tenant Context
+ └── Organization Context
  │
  ▼
 Query Analyzer
