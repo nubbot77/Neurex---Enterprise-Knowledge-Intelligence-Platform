@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # No defaults — the app must refuse to start without these.
     database_url: str
+    migration_database_url: str
     redis_url: str
     qdrant_url: str
     jwt_secret_key: str

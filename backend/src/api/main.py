@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from api.config.logging import configure_logging
 from api.config.settings import Settings, get_settings
+from api.db.session import build_engine, build_session_factory
 from api.middleware.request_id import RequestIDMiddleware
 from api.routes.v1 import health
 
@@ -15,9 +16,17 @@ logger = structlog.get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
+
+    engine = build_engine(settings)
+    app.state.engine = engine
+    app.state.session_factory = build_session_factory(engine)
+
     logger.info("api.startup", environment=settings.environment)
-    yield
-    logger.info("api.shutdown")
+    try:
+        yield
+    finally:
+        await engine.dispose()
+        logger.info("api.shutdown")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

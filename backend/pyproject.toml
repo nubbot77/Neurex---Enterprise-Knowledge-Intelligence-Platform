@@ -13,6 +13,9 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "structlog>=26.1.0",
+    "sqlalchemy[asyncio]>=2.0.52",
+    "asyncpg>=0.31.0",
+    "alembic>=1.19.2",
 ]
 
 [tool.pytest.ini_options]
@@ -23,6 +26,7 @@ package = false
 
 [dependency-groups]
 dev = [
+    "colorama>=0.4.6",
     "ruff>=0.16.6",
 ]
 
