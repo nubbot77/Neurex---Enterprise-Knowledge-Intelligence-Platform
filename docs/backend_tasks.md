@@ -4,7 +4,7 @@ Derived from `docs/plan.md` and `docs/architecture.md`. Ordered by implementatio
 
 Every task includes a plain-language description of what it does and why it matters.
 
-**Status:** Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅ · Phase 3 next — 3 of 34 phases complete
+**Status:** Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅ · Phase 3 ✅ · Phase 4 ✅ · Phase 5 next — 5 of 34 phases complete
 
 > **Ordering was audited and corrected.** 14 tasks were previously listed before their own dependencies. See [Sequencing Fixes Applied](#sequencing-fixes-applied) at the end for the full list of what moved and why.
 
@@ -72,7 +72,7 @@ Every task includes a plain-language description of what it does and why it matt
 
 ---
 
-## Phase 3 — Database Layer (SQLAlchemy + Alembic)
+## Phase 3 — Database Layer (SQLAlchemy + Alembic) ✅
 
 | # | Task | Difficulty |
 |---|---|---|
@@ -105,7 +105,7 @@ Three, not two. `User` is a global identity with no role column; `Organization` 
 
 ---
 
-## Phase 4 — Authentication
+## Phase 4 — Authentication ✅
 
 | # | Task | Difficulty |
 |---|---|---|

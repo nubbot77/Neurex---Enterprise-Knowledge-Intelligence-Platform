@@ -1,8 +1,8 @@
 # Handover
 
 **Project:** Neurex — Enterprise Knowledge Intelligence Platform
-**Last updated:** 2026-09-19
-**Progress:** Phases 0–2 complete, Phase 3 at 4/8 tasks — **3.5 of 34 phases**
+**Last updated:** 2026-09-19 (Phase 4 closed)
+**Progress:** Phases 0–4 complete — **5 of 34 phases**
 
 Task list and full phase breakdown: `docs/backend_tasks.md`
 Identity, tenancy and RBAC specification: `docs/architecture.md` §7
@@ -12,11 +12,24 @@ Architecture and directory structure: `docs/plan.md`
 
 ## 1. Where to pick up
 
-**Next task: Phase 3, Task 5 — `User`, `Organization`, and `Membership` models.**
+**Next task: Phase 5, Task 1 — the membership lifecycle service (invite, accept,
+suspend, remove).**
 
-Three models, not two. The identity and tenancy model is now specified in full in `architecture.md` §7 — read it before writing them. Summary of what it changes: `role` lives on `Membership`, not `User`; solo users get a personal `Organization` so `organization_id` is `NOT NULL` everywhere; `User.is_super_admin` must be in this first migration rather than backfilled later.
+Phase 4 is closed: the caller's identity is established and `get_current_user` hands
+any route a `User`. Phase 5 decides what that user may *do* — organization context
+from the URL, the role→permission matrix, `require(Permission)` with default deny, and
+the organization-scoped base repository that injects `WHERE organization_id = ?` into
+every query.
 
-After Task 5: Task 6 (first real migration), Task 7 (repository base class), Task 8 (verify migration round-trip on a fresh DB).
+Read `architecture.md` §7.6 to §7.10 first. Three rules there are easy to get wrong
+and expensive to retrofit: absent membership returns **404, not 403**; a route that
+declares no permission **denies everything**; and the `super_admin` bypass is an
+explicit named argument, audited, and read-only.
+
+The access token deliberately carries no role and no organization, so Phase 5 resolves
+authority per request and caches it in Redis under
+`membership:{user_id}:{organization_id}`, deleting the key whenever the membership row
+changes.
 
 ---
 
@@ -64,7 +77,7 @@ All credentials and ports come from the **root** `.env` (Compose reads `.env` fr
 
 Verified live: startup log fires, `/api/v1/health` returns `200 {"status":"ok"}` with an `X-Request-ID` header, a caller-supplied ID is propagated rather than replaced, hot reload triggers on save, and the app **refuses to boot** when a required setting is missing.
 
-### Phase 3 — Database Layer (4/8)
+### Phase 3 — Database Layer ✅ (8/8)
 
 | # | Task | Status |
 |---|---|---|
@@ -72,12 +85,81 @@ Verified live: startup log fires, `/api/v1/health` returns `200 {"status":"ok"}`
 | 2 | `db/session.py` — async engine, session-per-request | ✅ |
 | 3 | PgBouncer-compatible engine config | ✅ proven, see 5.3 |
 | 4 | Alembic init + wiring | ✅ |
-| 5 | First models: `User`, `Organization`, `Membership` | ⬜ **next** |
-| 6 | First migration | ⬜ |
-| 7 | Repository base class | ⬜ |
-| 8 | Verify migration round-trip | ⬜ |
+| 5 | First models: `User`, `Organization`, `Membership` | ✅ |
+| 6 | First migration + admin-count trigger | ✅ |
+| 7 | Repository base class | ✅ `db/repositories/base.py`, `users.py` |
+| 8 | Verify migration round-trip | ✅ verified 2026-09-19, see below |
 
-Alembic verified against the live database: connects, reads `Base.metadata`, autogenerate produces an empty migration (correct — no models yet).
+**Round-trip verification, 2026-09-19.** Run against a scratch database
+(`rag_roundtrip_check`, created and dropped, dev data untouched):
+
+```
+alembic upgrade head    → users, organizations, memberships, alembic_version
+alembic downgrade base  → only alembic_version remains; trigger and both
+                          functions dropped with it
+alembic upgrade head    → clean
+alembic revision --autogenerate → empty migration (no model/schema drift)
+uv run pytest -q        → 25 passed
+```
+
+The scratch database needed `pg_trgm`, `unaccent` and `btree_gin` created by hand —
+`infrastructure/postgres/init/` only runs on first boot of the cluster, not per
+database. Note also that Alembic goes through `MIGRATION_DATABASE_URL` (direct to
+Postgres, port 5432); overriding it as an environment variable is how to point a
+migration run at another database without editing `.env`.
+
+Alembic is wired to the live database and reads `Base.metadata` directly, so autogenerate is a real drift check rather than a formality — it currently produces an empty migration against the three models.
+
+---
+
+### Phase 4 — Authentication ✅ (10/10)
+
+Custom, self-hosted auth. No identity vendor: passwords live in `users.password_hash`,
+tokens are signed with `JWT_SECRET_KEY`, and every check runs in-process.
+
+| # | Task | File |
+|---|---|---|
+| 1 | Password hashing (Argon2id) | `src/api/auth/password.py` |
+| 2 | JWT encode/decode, claims, expiry | `src/api/auth/jwt.py` |
+| 3 | Access + refresh lifecycle, rotation | `src/api/auth/jwt.py`, `services/auth_service.py` |
+| 4 | Request/response models | `src/api/schemas/auth.py` |
+| 5 | Register / login / refresh / logout logic | `src/api/services/auth_service.py` |
+| 6 | Routes | `src/api/routes/v1/auth.py`, `routes/v1/me.py` |
+| 7 | `get_current_user` | `src/api/auth/dependencies.py` |
+| 8 | Redis client | `src/api/db/redis.py` |
+| 9 | Revocation deny-list | `src/api/auth/revocation.py` |
+| 10 | Security tests | `tests/test_auth_security.py`, `tests/test_auth_flow.py` |
+
+Endpoints: `POST /api/v1/auth/register` (201), `/login`, `/refresh`, `/logout` (204),
+`/logout-all` (204), and `GET /api/v1/me`.
+
+Decisions worth not re-deriving:
+
+- **Claims are `sub`, `jti`, `typ`, `iat`, `exp` — no role, no organization.** §7.8.
+  `typ` is checked on every decode, or a 7-day refresh token works as an access token.
+- **`algorithms=[...]` is pinned server-side** in `decode_token`, which is what makes
+  the `alg: none` and RS256→HS256 confusion attacks fail.
+- **Registration writes three rows in one transaction** and sets the membership to
+  `active` explicitly — the column default is `pending`, which is for invitations.
+- **Login verifies against a dummy hash when the account is absent.** Returning early
+  answers in ~1 ms versus ~60 ms and is a working email-enumeration oracle.
+- **Refresh rotates, and reuse of a spent `jti` revokes every session for that user.**
+- **Revocation stores the exception, not the session**: `revoked:jti:{jti}` with a TTL
+  equal to the token's remaining life, plus `revoked:user:{sub}` as a cutoff for
+  "log out everywhere". Every authenticated request now costs one Redis round-trip.
+- **Errors**: one `AuthError` hierarchy, mapped to responses in `main.py`. The client
+  sees a fixed `detail`; the log gets `reason`. Structlog events are `auth.registered`,
+  `auth.login`, `auth.login_failed`, `auth.refreshed`, `auth.refresh_reused`,
+  `auth.logout`, `auth.token_rejected` — identifiers and reason codes only, never a
+  password, hash or whole token.
+
+**Verified 2026-09-19:** 61 tests pass (`uv run pytest -q`), ruff clean, and a live
+server on real Postgres + Redis returned 201 for register, 200 for `/me`, 401 with no
+token, 204 for logout and 401 for `/me` afterwards — with `revoked:jti:*` keys present
+in Redis carrying a TTL, and the three rows written with `active_admin_count = 1`.
+
+New dependencies: `argon2-cffi`, `pyjwt`, `redis`, `pydantic[email]`; dev `httpx`,
+`fakeredis`.
 
 ---
 
@@ -226,10 +308,31 @@ Both set `True` in `migrations/env.py`. They default to `False`, and with the de
 
 ---
 
+### 5.8 Test fixtures must share one connection
+
+The `client` fixture (HTTP, through the app) and the `session` fixture (direct SQL)
+have to run on the **same** `AsyncConnection`, and its sessions need
+`join_transaction_mode="create_savepoint"`.
+
+Two separate connections means two transactions: rows written through the API are
+invisible to the test's own session, and a `is_active = false` written by the test is
+invisible to the app. Both failure modes look like a logic bug in the code under test
+rather than a fixture problem, and cost time to track down. Without `create_savepoint`,
+the service's real `commit()` ends the outer transaction and test data survives the
+rollback.
+
+### 5.9 `EmailStr` rejects `.test` addresses
+
+`pydantic[email]` refuses special-use domains, so the `@example.test` addresses used in
+the repository tests return **422** from any route taking an `EmailStr`. The auth tests
+use `@example.com`, which it accepts.
+
+---
+
 ## 6. Loose ends
 
-- **Uncommitted:** `backend/src/api/db/`, `backend/migrations/`, `backend/alembic.ini`, plus edits to `settings.py`, `main.py`, `pyproject.toml`, `uv.lock`, `.env.example`. Last commit is `c203f16` (Phases 1–2).
+- **Uncommitted:** all of Phase 4 (`src/api/auth/`, `src/api/schemas/`, `src/api/services/`, `src/api/db/redis.py`, `routes/v1/auth.py`, `routes/v1/me.py`, `main.py`, the auth tests), plus the Phase 3 trigger migration and `tests/test_admin_count.py`, plus the new root `CLAUDE.md`. Last commit is `89031d4`.
 - **`docs/*.bak`** — pre-rewrite backups of `plan.md` and `backend_tasks.md`. Delete or gitignore once the rewrites are trusted.
 - **Qdrant pinned to `:latest`** in compose. Every other image is pinned; this one should be too.
 - **Line endings** — git warns `LF will be replaced by CRLF`. Harmless now, but a `.gitattributes` with `* text=auto eol=lf` is worth adding before Phase 32, since CRLF breaks shell scripts inside Docker images.
-- **No tests yet.** `backend/tests/` exists but is empty. `backend_tasks.md` notes that tests belong with each phase rather than deferred to Phase 30.
+- **Tests:** 61 passing — repositories, admin-count trigger, auth flow and auth security, on a session-scoped engine through PgBouncer with per-test rollback. `backend_tasks.md` keeps tests with each phase rather than deferring them to Phase 30.
