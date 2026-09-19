@@ -1,8 +1,8 @@
 # Handover
 
 **Project:** Neurex — Enterprise Knowledge Intelligence Platform
-**Last updated:** 2026-09-19 (Phase 4 closed)
-**Progress:** Phases 0–4 complete — **5 of 34 phases**
+**Last updated:** 2026-09-19 (Phase 5 closed)
+**Progress:** Phases 0–5 complete — **6 of 34 phases**
 
 Task list and full phase breakdown: `docs/backend_tasks.md`
 Identity, tenancy and RBAC specification: `docs/architecture.md` §7
@@ -12,24 +12,21 @@ Architecture and directory structure: `docs/plan.md`
 
 ## 1. Where to pick up
 
-**Next task: Phase 5, Task 1 — the membership lifecycle service (invite, accept,
-suspend, remove).**
+**Next task: Phase 6, Task 1 — `shared/storage/base.py`, the `StorageProvider`
+interface.**
 
-Phase 4 is closed: the caller's identity is established and `get_current_user` hands
-any route a `User`. Phase 5 decides what that user may *do* — organization context
-from the URL, the role→permission matrix, `require(Permission)` with default deny, and
-the organization-scoped base repository that injects `WHERE organization_id = ?` into
-every query.
+Phase 5 is closed. Organization context, the role→permission matrix, `require()` with
+default deny, the organization-scoped repository and the audited `super_admin` bypass
+are all in place, and `/api/v1/orgs/{organization_id}/…` is the shape every
+organization-owned route takes from here on.
 
-Read `architecture.md` §7.6 to §7.10 first. Three rules there are easy to get wrong
-and expensive to retrofit: absent membership returns **404, not 403**; a route that
-declares no permission **denies everything**; and the `super_admin` bypass is an
-explicit named argument, audited, and read-only.
-
-The access token deliberately carries no role and no organization, so Phase 5 resolves
-authority per request and caches it in Redis under
-`membership:{user_id}:{organization_id}`, deleting the key whenever the membership row
-changes.
+What that means for Phase 6: a `Document` repository subclasses
+`OrgScopedRepository`, not `BaseRepository`, and gets `WHERE organization_id = ?` for
+free. Every document route declares a permission with `require(...)` — a route that
+forgets is refused at runtime and logged as an error at boot, so the omission is loud
+rather than silent. Add each new scoped route to `SCOPED_ROUTES` in
+`tests/test_isolation.py`; that list is what "every route scoped to it" in invariant 3
+actually means.
 
 ---
 
@@ -160,6 +157,81 @@ in Redis carrying a TTL, and the three rows written with `active_admin_count = 1
 
 New dependencies: `argon2-cffi`, `pyjwt`, `redis`, `pydantic[email]`; dev `httpx`,
 `fakeredis`.
+
+---
+
+---
+
+### Phase 5 — Multi-Tenancy and RBAC ✅ (12/12)
+
+| # | Task | File |
+|---|---|---|
+| 1 | Membership lifecycle — invite, accept, role, suspend, remove, reinstate, leave | `src/api/services/membership_service.py` |
+| 2 | `Permission` enum + role matrix | `src/api/auth/permissions.py` |
+| 3 | `OrgContext` | `src/api/auth/context.py` |
+| 4 | `get_org_context` + Redis membership cache | `src/api/auth/dependencies.py`, `auth/membership_cache.py` |
+| 5 | `require(Permission)` + default deny | `src/api/auth/rbac.py` |
+| 6 | Organization-scoped base repository | `src/api/db/repositories/org_scoped.py` |
+| 7 | Repositories retrofitted | `db/repositories/memberships.py`, `organizations.py` |
+| 8 | Admin range — DB layer from Phase 3, service layer here | `membership_service._guard_admin_range` |
+| 9 | `super_admin` bypass + `audit_log` | `org_scoped.get_across_tenants`, `models/audit.py` |
+| 10 | Routes under `/orgs/{organization_id}/` | `routes/v1/orgs.py`, `routes/v1/members.py`, `routes/v1/me.py` |
+| 11 | Cross-tenant isolation suite | `tests/test_isolation.py` (28 tests) |
+| 12 | RBAC suite | `tests/test_rbac.py` (63 tests) |
+
+Endpoints added:
+
+```
+POST   /api/v1/orgs                                             create a team org (201)
+GET    /api/v1/orgs/{org}                                       org:read
+PATCH  /api/v1/orgs/{org}                                       org:update
+DELETE /api/v1/orgs/{org}                                       org:delete  (deactivates, 204)
+POST   /api/v1/orgs/{org}/leave                                 org:read
+GET    /api/v1/orgs/{org}/members                               member:read
+POST   /api/v1/orgs/{org}/members                               member:invite (201)
+GET    /api/v1/orgs/{org}/members/{id}                          member:read
+PATCH  /api/v1/orgs/{org}/members/{id}/role                     member:update_role
+POST   /api/v1/orgs/{org}/members/{id}/suspend                  member:remove
+POST   /api/v1/orgs/{org}/members/{id}/reinstate                member:invite
+DELETE /api/v1/orgs/{org}/members/{id}                          member:remove
+GET    /api/v1/me/organizations                                 authenticated
+POST   /api/v1/me/invitations/{org}/accept                      authenticated
+```
+
+Decisions worth not re-deriving:
+
+- **`POST /api/v1/orgs` was added, and is not in the task list.** Nothing else can
+  create a team organization — registration only ever makes a personal one, and a
+  personal workspace cannot take members (§7.3) — so invitations, the members routes
+  and most of the isolation suite would have been unreachable without it. It is not
+  organization-scoped (there is no organization yet), so it sits outside default deny
+  and requires only authentication.
+- **Accepting an invitation lives under `/me`, not under `/orgs/{id}/`.** A pending
+  membership resolves to no context, so a route under the scoped prefix would 404 the
+  exact person it exists for.
+- **Invitations require an existing account.** Inviting an address that has never
+  registered needs an emailed invitation token, which belongs with the email
+  infrastructure; the endpoint returns 409 rather than writing a row nobody can accept.
+- **Two membership repositories, deliberately.** `MembershipRepository` is unscoped
+  because it is what *establishes* the scope; `OrgMembershipRepository` inherits the
+  mandatory filter for everything after a context exists. One class with a flag would
+  be a method that is sometimes scoped, decided by an argument nobody checks.
+- **Removal and suspension share an end state** (`suspended`) and differ in the audit
+  action. The row is retained because audit rows reference it (§7.4).
+- **The admin count moves at accept, not at invite** — a pending admin is not an active
+  one — so that is where the ceiling check fires.
+- **`audit_log` has no FK on `organization_id` and no `updated_at`.** The row for a
+  deletion has to outlive the tenant, and an audit row is not editable.
+
+**Verified 2026-09-19:** 177 tests pass (`uv run pytest -q`), ruff clean, migrations
+round-tripped on a scratch database (`rag_roundtrip_check`, created and dropped:
+`upgrade head` → 4 tables, `downgrade base` → only `alembic_version`, `upgrade head`
+again clean, `--autogenerate` produced an empty migration), and a live server on real
+Postgres + real Redis was driven through the whole flow: create team (201,
+`active_admin_count: 1`), invite (pending), pending member reading the org (404),
+accept (active), member reading (200) and patching (403), outsider reading (404),
+promotion to admin (count 2), suspension, suspended member reading (404), and demoting
+the last admin (409). A `membership:{user}:{org}` key was present in Redis with a TTL.
 
 ---
 
@@ -327,12 +399,65 @@ rollback.
 the repository tests return **422** from any route taking an `EmailStr`. The auth tests
 use `@example.com`, which it accepts.
 
+### 5.10 FastAPI 0.141 no longer flattens `include_router`
+
+`app.routes` used to contain every route. It now holds a nested `_IncludedRouter` per
+`include_router` call, carrying `.original_router` and an `.include_context` with the
+prefix. A scan of `app.routes` looking for `APIRoute` finds **three** built-in routes
+and none of ours.
+
+This matters because the default-deny audit is such a scan: written the obvious way it
+passes while checking nothing. `api.auth.rbac.iter_api_routes` walks the tree instead
+and is what both `scan_permission_declarations` and the
+`test_every_org_scoped_route_declares_a_permission` test go through.
+
+Starlette 1.6 also does not set `scope["route"]` — only `scope["endpoint"]` — which is
+why the request-time guard matches on the endpoint function rather than the route.
+
+### 5.11 `ctx.log_fields()` already carries `role`
+
+`logger.info("membership.invited", role=role.value, **ctx.log_fields())` raises
+`TypeError: got multiple values for keyword argument 'role'` — structlog's bound
+method takes the collision as a duplicate argument, and it surfaces as a 500 from the
+route rather than as a logging warning. Any new log line naming a role must pick a
+distinct key (`invited_role`, `previous_role`, `new_role`).
+
+### 5.12 The admin-count trigger runs after the ORM has read the row
+
+`OrganizationService.create` flushes the organization, inserts the admin membership,
+and commits; the trigger then updates `organizations.active_admin_count` underneath.
+With `expire_on_commit=False`, the in-memory object still says `0`, so the create
+response reported `active_admin_count: 0` for an organization that had one admin —
+caught by the live smoke test, not by the suite, because the tests assert the database
+value. `await session.refresh(organization)` after the commit is the fix, and the same
+applies to any response returning a trigger-maintained column.
+
+
 ---
 
 ## 6. Loose ends
 
-- **Uncommitted:** all of Phase 4 (`src/api/auth/`, `src/api/schemas/`, `src/api/services/`, `src/api/db/redis.py`, `routes/v1/auth.py`, `routes/v1/me.py`, `main.py`, the auth tests), plus the Phase 3 trigger migration and `tests/test_admin_count.py`, plus the new root `CLAUDE.md`. Last commit is `89031d4`.
-- **`docs/*.bak`** — pre-rewrite backups of `plan.md` and `backend_tasks.md`. Delete or gitignore once the rewrites are trusted.
-- **Qdrant pinned to `:latest`** in compose. Every other image is pinned; this one should be too.
-- **Line endings** — git warns `LF will be replaced by CRLF`. Harmless now, but a `.gitattributes` with `* text=auto eol=lf` is worth adding before Phase 32, since CRLF breaks shell scripts inside Docker images.
-- **Tests:** 61 passing — repositories, admin-count trigger, auth flow and auth security, on a session-scoped engine through PgBouncer with per-test rollback. `backend_tasks.md` keeps tests with each phase rather than deferring them to Phase 30.
+- **`docs/*.bak`** — pre-rewrite backups of `plan.md` and `backend_tasks.md`. Delete or
+  gitignore once the rewrites are trusted.
+- **Qdrant pinned to `:latest`** in compose. Every other image is pinned; this one
+  should be too.
+- **Line endings** — git warns `LF will be replaced by CRLF`. Harmless now, but a
+  `.gitattributes` with `* text=auto eol=lf` is worth adding before Phase 32, since
+  CRLF breaks shell scripts inside Docker images.
+- **Invitations need an existing account.** `POST /orgs/{org}/members` returns 409 for
+  an address that has never registered. Emailed invitation tokens are the missing
+  piece, and they wait on email infrastructure.
+- **Organization deactivation is bounded by the cache TTL for other members.** The
+  admin who runs it is locked out immediately only because their own key is
+  invalidated; everyone else keeps a cached membership for up to
+  `membership_cache_ttl_seconds` (30s). Invalidating every member's key needs either a
+  per-organization key set or a generation counter — worth doing when deactivation
+  becomes a real operation rather than a test.
+- **`MembershipService._translate` is not covered by a test.** It maps the trigger's
+  and the CHECK's errors onto the same 409 the service-layer guard returns, for the
+  concurrent case where two requests both pass the guard. Reproducing that race needs
+  two connections committing in lockstep; the DB half is covered by
+  `tests/test_admin_count.py`, the translation half is not.
+- **Tests:** 177 passing — repositories, admin-count trigger, auth flow and security,
+  RBAC (63), cross-tenant isolation (28) and membership lifecycle (25), on a
+  session-scoped engine through PgBouncer with per-test rollback.

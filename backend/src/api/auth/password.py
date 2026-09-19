@@ -50,7 +50,7 @@ def verify_password(plain: str, hashed: str) -> bool:
     """
     try:
         _hasher.verify(hashed, plain)
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
+    except VerifyMismatchError, VerificationError, InvalidHashError:
         return False
     return True
 

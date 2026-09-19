@@ -6,12 +6,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api.auth.exceptions import AuthError
+from api.auth.rbac import scan_permission_declarations
 from api.config.logging import configure_logging
 from api.config.settings import Settings, get_settings
 from api.db.redis import build_redis
 from api.db.session import build_engine, build_session_factory
 from api.middleware.request_id import RequestIDMiddleware
-from api.routes.v1 import auth, health, me
+from api.routes.v1 import auth, health, me, members, orgs
 
 logger = structlog.get_logger(__name__)
 
@@ -76,6 +77,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(me.router, prefix="/api/v1")
+    app.include_router(orgs.creation_router, prefix="/api/v1")
+    app.include_router(orgs.router, prefix="/api/v1")
+    app.include_router(members.router, prefix="/api/v1")
+
+    # Default deny, decided once at boot: every organization-scoped route is checked
+    # for a declared permission, and the ones without are logged as errors. The
+    # request-time guard on the organization routers refuses them anyway — this makes
+    # the omission visible at startup rather than in a support ticket.
+    scan_permission_declarations(app)
     return app
 
 

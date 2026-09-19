@@ -146,7 +146,7 @@ Registration writes three rows, not one, in a single transaction: the `User`, a 
 
 ---
 
-## Phase 5 — Multi-Tenancy and RBAC
+## Phase 5 — Multi-Tenancy and RBAC ✅
 
 | # | Task | Difficulty |
 |---|---|---|
