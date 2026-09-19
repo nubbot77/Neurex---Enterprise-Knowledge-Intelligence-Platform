@@ -5,6 +5,7 @@ that registry and never scans directories, so a model whose module is never impo
 invisible to autogenerate and silently produces an empty migration.
 """
 
+from api.models.audit import AuditLog
 from api.models.membership import (
     AccountType,
     Membership,
@@ -16,6 +17,7 @@ from api.models.user import User
 
 __all__ = [
     "AccountType",
+    "AuditLog",
     "Membership",
     "MembershipRole",
     "MembershipStatus",

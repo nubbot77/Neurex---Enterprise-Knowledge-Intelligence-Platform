@@ -1,7 +1,8 @@
 # src/api/db/session.py
 from collections.abc import AsyncGenerator
+from typing import Annotated
 
-from fastapi import Request
+from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -40,3 +41,8 @@ async def get_session(request: Request) -> AsyncGenerator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+
+
+# Written once so routes and services annotate the session without repeating the
+# ``Annotated[...]`` noise at every call site.
+SessionDep = Annotated[AsyncSession, Depends(get_session)]

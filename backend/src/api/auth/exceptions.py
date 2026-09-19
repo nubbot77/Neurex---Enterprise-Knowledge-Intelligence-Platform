@@ -73,3 +73,98 @@ class EmailAlreadyRegistered(AuthError):
 
     status_code = 409
     detail = "That email is already registered"
+
+
+# --- Authorization — Phase 5 -------------------------------------------------
+#
+# Authentication answers "who is this?" and fails with 401. Everything below answers
+# "may they?" and fails with 403, 404 or 409. They share ``AuthError`` so the single
+# handler in ``api.main`` keeps mapping status codes in one place.
+
+
+class OrganizationNotFound(AuthError):
+    """No organization, or no active membership in it — deliberately indistinguishable.
+
+    Architecture §7.8. A 403 here would confirm that the organization exists, which
+    leaks the existence and the id space of other tenants to anyone walking UUIDs. The
+    two cases are answered identically on purpose: a user with no active membership is
+    told exactly what a user asking about a nonexistent tenant is told.
+    """
+
+    status_code = 404
+    detail = "Organization not found"
+
+
+class PermissionDenied(AuthError):
+    """Membership is established and active, but the role is insufficient.
+
+    403 is correct here, and only here. The caller already knows the organization
+    exists — they are in it — so a precise error leaks nothing and saves them guessing.
+    """
+
+    status_code = 403
+    detail = "You do not have permission to perform this action"
+
+
+class MembershipNotFound(AuthError):
+    """The membership being operated on does not exist in this organization.
+
+    Scoped by organization before it is looked up, so this cannot be used to probe for
+    membership ids belonging to another tenant.
+    """
+
+    status_code = 404
+    detail = "Membership not found"
+
+
+class MembershipConflict(AuthError):
+    """The membership is not in a state this operation accepts.
+
+    Covers inviting someone who is already a member, accepting an invitation that was
+    never issued, and suspending a membership that is already suspended.
+    """
+
+    status_code = 409
+    detail = "That membership is not in a state this operation allows"
+
+
+class PersonalOrganizationClosed(AuthError):
+    """A personal workspace cannot take a second member — architecture §7.3.
+
+    ``kind = 'personal'`` exists so that every user owns a tenant from their first
+    second. Letting one grow members would give it the semantics of a team without any
+    of the checks a team gets.
+    """
+
+    status_code = 409
+    detail = "A personal workspace cannot have additional members"
+
+
+class AdminRangeViolation(AuthError):
+    """The operation would leave the organization outside its admin range.
+
+    Architecture §7.7: at least one and at most ``max_admins`` active admins. The
+    database enforces this authoritatively — a CHECK constraint for the ceiling and a
+    trigger for the floor. This error exists purely so the caller sees a 409 with a
+    usable message instead of a constraint violation surfaced as a 500.
+
+    This service-layer check is a courtesy, not the guarantee. On its own it would be a
+    bug: two concurrent requests can both pass it, and only the row lock the trigger
+    takes decides.
+    """
+
+    status_code = 409
+    detail = "That change would leave the organization outside its admin range"
+
+
+class CrossTenantWriteForbidden(AuthError):
+    """A super_admin bypass was asked to write — architecture §7.10.
+
+    Cross-tenant reads are support work. Cross-tenant writes have no legitimate use and
+    turn one mistaken operation into damage across several customers. The two
+    exceptions, admin recovery and organization deletion, are audited operations of
+    their own rather than uses of the bypass.
+    """
+
+    status_code = 403
+    detail = "Cross-tenant access is read-only"

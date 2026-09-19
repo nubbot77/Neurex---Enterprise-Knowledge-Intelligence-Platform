@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
 
+    # How long a resolved membership may be reused without re-reading the row.
+    # Correctness comes from invalidating the key on every membership write; this only
+    # bounds staleness for changes made outside the service (§7.8), so it is short.
+    membership_cache_ttl_seconds: int = 30
+
     # Filled in later phases; empty is valid for now.
     llm_api_key: str = ""
     llm_base_url: str = ""
