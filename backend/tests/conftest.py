@@ -8,10 +8,12 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
+from api.auth.dependencies import get_storage
 from api.config.settings import get_settings
 from api.db.redis import get_redis
 from api.db.session import build_engine, get_session
 from api.main import create_app
+from fakes import InMemoryStorage
 
 
 @pytest.fixture(scope="session")
@@ -86,8 +88,19 @@ async def redis() -> AsyncGenerator[fakeredis.aioredis.FakeRedis]:
     await client.aclose()
 
 
+@pytest.fixture
+def storage() -> InMemoryStorage:
+    """Object storage for one test, in a dictionary.
+
+    Phase 6 writes bytes to R2. A test suite that needed a bucket would need
+    credentials, a network and a cleanup story, and would stop being runnable on a
+    laptop — so the provider is swapped and everything above it is the real code.
+    """
+    return InMemoryStorage()
+
+
 @pytest_asyncio.fixture
-async def client(connection, redis, settings) -> AsyncGenerator[AsyncClient]:
+async def client(connection, redis, settings, storage) -> AsyncGenerator[AsyncClient]:
     """An HTTP client against the real app, on the test's own transaction."""
     factory = _session_factory(connection)
 
@@ -98,9 +111,17 @@ async def client(connection, redis, settings) -> AsyncGenerator[AsyncClient]:
     async def override_redis():
         return redis
 
+    def override_storage() -> InMemoryStorage:
+        return storage
+
     app = create_app(settings)
     app.dependency_overrides[get_session] = override_session
     app.dependency_overrides[get_redis] = override_redis
+    # The app never runs its lifespan under ASGITransport, so app.state.storage is
+    # never set and the real dependency would answer 503. This override is the only
+    # source of a storage provider in tests, exactly as the two above are for the
+    # session and Redis.
+    app.dependency_overrides[get_storage] = override_storage
 
     # ASGITransport talks to the app object directly — no socket and no lifespan, so
     # the overrides above are the only sources of a session and a Redis client.

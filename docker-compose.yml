@@ -126,6 +126,48 @@ services:
     networks:
       - rag_network
 
+  # ==========================================
+  # MinIO — S3-compatible object storage (local stand-in for Cloudflare R2)
+  # ==========================================
+  #
+  # Phase 6 stores source files in R2. R2 speaks S3, and so does MinIO, so the same
+  # `R2Storage` provider drives both — only STORAGE_ENDPOINT_URL changes. This is what
+  # makes document upload work on a laptop with no Cloudflare account.
+  #
+  # Not a production component. Against a real bucket, point the backend at R2 and
+  # leave this container stopped.
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: rag_minio
+    restart: unless-stopped
+
+    # MinIO refuses to start with a root password under 8 characters.
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
+    command: server /data --console-address ":9001"
+
+    ports:
+      # 9000 is a popular default (Portainer, SonarQube, others), so the host side
+      # moves out of its way like Redis did. The container side stays standard.
+      - "127.0.0.1:${MINIO_API_PORT:-9010}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9011}:9001"
+
+    volumes:
+      - minio_data:/data
+
+    healthcheck:
+      # MinIO's own readiness endpoint, not a TCP probe: the port opens before the
+      # server will answer an S3 request, and a bucket created in that window fails.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - rag_network
+
 # ==========================================
 # Persistent Volumes
 # ==========================================
@@ -140,6 +182,9 @@ volumes:
 
   qdrant_data:
     name: rag_qdrant_data
+
+  minio_data:
+    name: rag_minio_data
 
 
 

@@ -20,6 +20,8 @@ dependencies = [
     "bcrypt>=5.0.0",
     "pyjwt>=2.10.1",
     "redis>=5.2.0",
+    "aioboto3>=15.5.0",
+    "python-multipart>=0.0.32",
 ]
 
 [tool.pytest.ini_options]

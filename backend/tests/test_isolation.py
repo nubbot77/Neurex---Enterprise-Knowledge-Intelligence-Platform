@@ -35,6 +35,21 @@ SCOPED_ROUTES = [
     ("post", "/api/v1/orgs/{org}/leave"),
     ("get", "/api/v1/orgs/{org}/members"),
     ("post", "/api/v1/orgs/{org}/members"),
+    # Phase 6. The document id below is a literal that exists nowhere: context
+    # resolution refuses an outsider before any handler runs, so the id never has to
+    # be real for this list to test what it claims to test.
+    ("get", "/api/v1/orgs/{org}/documents"),
+    ("post", "/api/v1/orgs/{org}/documents"),
+    ("get", "/api/v1/orgs/{org}/documents/11111111-1111-1111-1111-111111111111"),
+    ("patch", "/api/v1/orgs/{org}/documents/11111111-1111-1111-1111-111111111111"),
+    ("delete", "/api/v1/orgs/{org}/documents/11111111-1111-1111-1111-111111111111"),
+    ("get", "/api/v1/orgs/{org}/documents/11111111-1111-1111-1111-111111111111/versions"),
+    ("post", "/api/v1/orgs/{org}/documents/11111111-1111-1111-1111-111111111111/versions"),
+    ("get", "/api/v1/orgs/{org}/documents/11111111-1111-1111-1111-111111111111/download"),
+    (
+        "get",
+        "/api/v1/orgs/{org}/documents/11111111-1111-1111-1111-111111111111/versions/1/download",
+    ),
 ]
 
 

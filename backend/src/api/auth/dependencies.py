@@ -15,7 +15,7 @@ from typing import Annotated
 from uuid import UUID
 
 import structlog
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,8 +32,11 @@ from api.db.session import get_session
 from api.models.membership import MembershipStatus
 from api.models.user import User
 from api.services.auth_service import AuthService
+from api.services.document_errors import StorageNotConfigured
+from api.services.document_service import DocumentService
 from api.services.membership_service import MembershipService
 from api.services.organization_service import OrganizationService
+from shared.storage.base import StorageProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -190,3 +193,40 @@ async def get_organization_service(
 
 MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
 OrganizationServiceDep = Annotated[OrganizationService, Depends(get_organization_service)]
+
+
+# --- Documents — Phase 6 -----------------------------------------------------
+
+
+def get_storage(request: Request) -> StorageProvider:
+    """The storage provider built once at startup.
+
+    Read from ``app.state`` rather than constructed per request: one provider holds
+    one botocore session and its signing configuration, and rebuilding that per upload
+    is pure overhead. Going through a dependency rather than importing it is what lets
+    a test swap in an in-memory provider with one override.
+
+    ``None`` means the server has no storage credentials. That is a 503 at the routes
+    that need it, not a crash at boot — see ``StorageNotConfigured``.
+    """
+    storage: StorageProvider | None = getattr(request.app.state, "storage", None)
+    if storage is None:
+        logger.error("storage.not_configured", path=request.url.path)
+        raise StorageNotConfigured(reason="storage_unconfigured")
+    return storage
+
+
+async def get_document_service(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    storage: Annotated[StorageProvider, Depends(get_storage)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DocumentService:
+    return DocumentService(
+        session=session,
+        storage=storage,
+        max_upload_bytes=settings.max_upload_bytes,
+    )
+
+
+DocumentServiceDep = Annotated[DocumentService, Depends(get_document_service)]
+StorageDep = Annotated[StorageProvider, Depends(get_storage)]

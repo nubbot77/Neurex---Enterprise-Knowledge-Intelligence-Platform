@@ -36,10 +36,22 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = ""
     embedding_model: str = ""
+
+    # Object storage — Phase 6. Empty is still valid: the app boots without it and
+    # logs a warning, and only the document routes refuse (503). Making these
+    # required would stop the whole API starting on a machine with no bucket, which
+    # would take authentication and every other phase down with it.
     storage_bucket: str = ""
     storage_endpoint_url: str = ""
     storage_access_key_id: str = ""
     storage_secret_access_key: str = ""
+    # Cloudflare R2 has one region and calls it "auto". A real S3 bucket needs its own.
+    storage_region: str = "auto"
+
+    # The upload ceiling, enforced against bytes actually read. 100 MiB covers the
+    # document formats this system ingests; raising it is a settings change, and the
+    # streaming upload path means it costs memory nowhere.
+    max_upload_bytes: int = 100 * 1024 * 1024
 
 
 @lru_cache

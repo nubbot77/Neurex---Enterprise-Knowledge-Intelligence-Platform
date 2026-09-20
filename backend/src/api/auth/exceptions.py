@@ -8,20 +8,20 @@ status code for "bad credentials" cannot drift between routes.
 
 from __future__ import annotations
 
+from api.errors import APIError
 
-class AuthError(Exception):
-    """Base class. Carries the status and the body the client will see."""
+
+class AuthError(APIError):
+    """Base class for auth failures. Defaults to 401.
+
+    The ``detail``/``reason`` split lives on ``APIError`` (Phase 6), so one handler in
+    ``api.main`` maps every domain error in the system. What is kept here is the
+    default status: anything raised by this hierarchy without one is a credential
+    failure, and a credential failure is a 401.
+    """
 
     status_code: int = 401
     detail: str = "Could not validate credentials"
-
-    def __init__(self, detail: str | None = None, *, reason: str | None = None) -> None:
-        # ``detail`` is what the client reads. ``reason`` is what the log records — the
-        # two are deliberately different for credential failures, so the response stays
-        # uninformative while the log stays useful.
-        self.detail = detail or type(self).detail
-        self.reason = reason or type(self).__name__
-        super().__init__(self.detail)
 
 
 class InvalidCredentials(AuthError):

@@ -1,8 +1,8 @@
 # Handover
 
 **Project:** Neurex — Enterprise Knowledge Intelligence Platform
-**Last updated:** 2026-09-19 (Phase 5 closed)
-**Progress:** Phases 0–5 complete — **6 of 34 phases**
+**Last updated:** 2026-09-19 (Phase 6 closed)
+**Progress:** Phases 0–6 complete — **7 of 34 phases**
 
 Task list and full phase breakdown: `docs/backend_tasks.md`
 Identity, tenancy and RBAC specification: `docs/architecture.md` §7
@@ -12,21 +12,33 @@ Architecture and directory structure: `docs/plan.md`
 
 ## 1. Where to pick up
 
-**Next task: Phase 6, Task 1 — `shared/storage/base.py`, the `StorageProvider`
-interface.**
+**Next task: Phase 7, Task 1 — `shared/queue/base.py`, the `Queue` interface.**
 
-Phase 5 is closed. Organization context, the role→permission matrix, `require()` with
-default deny, the organization-scoped repository and the audited `super_admin` bypass
-are all in place, and `/api/v1/orgs/{organization_id}/…` is the shape every
-organization-owned route takes from here on.
+Phase 6 is closed. A file uploads to object storage, is recorded as a `Document` plus
+an immutable `DocumentVersion`, and comes back out by streaming download. Nothing reads
+the file's contents yet — that is Phase 7 onwards.
 
-What that means for Phase 6: a `Document` repository subclasses
-`OrgScopedRepository`, not `BaseRepository`, and gets `WHERE organization_id = ?` for
-free. Every document route declares a permission with `require(...)` — a route that
-forgets is refused at runtime and logged as an error at boot, so the omission is loud
-rather than silent. Add each new scoped route to `SCOPED_ROUTES` in
-`tests/test_isolation.py`; that list is what "every route scoped to it" in invariant 3
-actually means.
+What that means for Phase 7, concretely:
+
+- **`job_id` already exists in the upload response and answers `null`.** Phase 7 fills
+  it in; adding the field later would have been a breaking change, so it is already
+  there (`api/schemas/documents.py`).
+- **`DocumentStatus` already declares `processing`, `ready` and `failed`.** Only
+  `uploaded` is ever written today. The values are in the CHECK constraint already, so
+  driving them is a code change and not another migration.
+- **The enqueue point is `DocumentService.upload` and `add_version`**, after the commit
+  that writes the rows — a job pointing at an uncommitted document is a job the worker
+  cannot find.
+- **Idempotency has its inputs ready.** Architecture §12 wants
+  `content hash + document/version identity + job identity`; the first two are columns
+  on `document_versions` now.
+- **`shared/` exists and is on the import path** (`src/shared/storage/`), so
+  `shared/queue/` follows the same shape: interface in `base.py`, implementation beside
+  it, nothing above it knowing which one is in use.
+
+Still true from Phase 5, and still the rule: every organization-scoped route declares a
+permission with `require(...)`, and every new one is added to `SCOPED_ROUTES` in
+`tests/test_isolation.py`.
 
 ---
 
@@ -46,7 +58,7 @@ actually means.
 
 ### Phase 1 — Local Infrastructure ✅
 
-`docker-compose.yml` at repo root. Four services, all healthchecked, all bound to **loopback only**:
+`docker-compose.yml` at repo root. Five services, all healthchecked, all bound to **loopback only**:
 
 | Service | Container | Host port | Notes |
 |---|---|---|---|
@@ -54,6 +66,20 @@ actually means.
 | PgBouncer 1.23.1 | `rag_pgbouncer` | 6432 | `pool_mode = transaction`, `LISTEN_PORT: 6432` |
 | Redis 8 | `rag_redis` | **6380** | Not 6379 — see gotcha 5.2 |
 | Qdrant | `rag_qdrant` | 6333 / 6334 | Still pinned `:latest` — should be pinned properly |
+| MinIO | `rag_minio` | **9010** / 9011 | Added in Phase 6. Local S3 standing in for R2; console on 9011 |
+
+**MinIO is a development component, not part of the deployed system.** Phase 6 stores
+files in Cloudflare R2, and R2 speaks S3 — so the same `R2Storage` provider drives
+both and only `STORAGE_ENDPOINT_URL` changes. It exists so document upload works on a
+machine with no Cloudflare account. Against a real bucket, point `backend/.env` at R2
+and leave this container stopped. Host ports are 9010/9011 because 9000/9001 are
+commonly taken; the container side stays standard, so an API running *inside* compose
+later would use `http://minio:9000`.
+
+The bucket is not created by the app — `cd backend && uv run python
+scripts/ensure_bucket.py` creates it, idempotently, through the same provider the API
+uses, so bad credentials fail there with a readable message rather than at the first
+upload.
 
 `infrastructure/postgres/init/01-extension.sql` installs `pg_trgm`, `unaccent`, `btree_gin` on first boot. Verified present in the live database.
 
@@ -233,6 +259,111 @@ accept (active), member reading (200) and patching (403), outsider reading (404)
 promotion to admin (count 2), suspension, suspended member reading (404), and demoting
 the last admin (409). A `membership:{user}:{org}` key was present in Redis with a TTL.
 
+### Phase 6 — Document Management ✅ (10/10)
+
+| # | Task | File |
+|---|---|---|
+| 1 | `StorageProvider` interface + §8 key layout | `src/shared/storage/base.py` |
+| 2 | R2 / S3-compatible implementation | `src/shared/storage/r2.py` |
+| 3 | `Document` + `DocumentVersion` + migration | `src/api/models/document.py`, `migrations/versions/9c6f36c3bd9b_*.py` |
+| 4 | Request / response schemas | `src/api/schemas/documents.py` |
+| 5 | Validation — extension, MIME, size, magic bytes | `src/api/services/file_validation.py` |
+| 6 | Content-hash dedup, scoped per organization | `db/repositories/documents.py`, `services/document_service.py` |
+| 7 | Document service | `src/api/services/document_service.py` |
+| 8 | Routes | `src/api/routes/v1/documents.py` |
+| 9 | Streaming upload + S3 multipart | `document_service._chunks`, `r2.put_stream` |
+| 10 | Organization isolation | `DocumentRepository(OrgScopedRepository)` + `tests/test_isolation.py` |
+
+Endpoints added:
+
+```
+POST   /api/v1/orgs/{org}/documents                             document:create (201)
+GET    /api/v1/orgs/{org}/documents                             document:read
+GET    /api/v1/orgs/{org}/documents/{id}                        document:read
+PATCH  /api/v1/orgs/{org}/documents/{id}                        document:update
+DELETE /api/v1/orgs/{org}/documents/{id}                        document:delete (204, soft)
+GET    /api/v1/orgs/{org}/documents/{id}/versions               document:read
+POST   /api/v1/orgs/{org}/documents/{id}/versions               document:update (201)
+GET    /api/v1/orgs/{org}/documents/{id}/download               document:read
+GET    /api/v1/orgs/{org}/documents/{id}/versions/{n}/download  document:read
+```
+
+No permission was added to the matrix — Phase 5 already defined all five
+`document:*` permissions. `document:delete` is admin-only; members may upload and
+revise. `document:reprocess` is still unused and belongs to Phase 7.
+
+Decisions worth not re-deriving:
+
+- **Storage is written before the database, and a failed database write deletes the
+  object.** A row pointing at a missing key is unfixable from outside — nothing can
+  tell whether the object was lost or never written. A stored object with no row is
+  garbage, and garbage is sweepable.
+- **Deduplication runs *after* the upload.** The hash is not knowable until the bytes
+  have been read, so a duplicate costs one wasted upload and is then deleted
+  (`_discard`). Hashing first would mean buffering the whole file, which is what the
+  streaming path exists to prevent.
+- **Dedup is scoped to `(organization_id, content_hash)`** — an index, not a unique
+  constraint. Global matching would leak the existence of one tenant's document to
+  another (invariant 2) and point two customers at one object; a unique constraint
+  would reject a version 3 that restores version 1's content, which is legitimate.
+- **A duplicate returns the existing document with `deduplicated: true`,** and a match
+  whose document was soft-deleted is *not* a duplicate — pointing the caller at a row
+  no route will show them is worse than storing the bytes again.
+- **Delete is soft, and the objects stay.** From Phase 19 a citation points at a
+  version; purging is a retention job with its own audit trail.
+- **Download streams through the API.** `presigned_url` exists on the provider and is
+  used by nothing: streaming keeps the tenant fence in the request path, where the
+  scoped repository enforces it, rather than in a URL whose only protection is expiry.
+- **`documents.current_version` is an integer, not a foreign key.** A key to
+  `document_versions.id` plus the one pointing back is a circular FK — `use_alter`, a
+  `post_update` relationship and a two-step migration — and buys nothing over the
+  number the `(document_id, version_number)` unique constraint already resolves.
+- **`APIError` is now the base of every domain error** (`src/api/errors.py`), and
+  `AuthError` subclasses it. Starlette resolves handlers by walking the MRO, so one
+  handler in `api.main` covers Phase 4, Phase 6 and every phase after.
+- **Storage is optional at boot.** Missing credentials log `storage.unconfigured` at
+  startup and every document route answers **503**. Requiring it would stop the whole
+  API starting on a machine with no bucket, taking authentication down with it.
+- **URL / web-page ingestion is not in this phase.** `plan.md` lists web pages as a
+  supported format, but fetching a URL needs SSRF defence (architecture §18, plan
+  Phase 27) and is not an upload.
+- **DOCX is verified only as a zip container.** Proving it is really OOXML means
+  reading the central directory, which is at the *end* of the file and unavailable to
+  a check that must decide before the upload starts. The Phase 8 parser opens the
+  package for real; what this check has to stop — an executable wearing a `.docx`
+  name — it does stop.
+
+**Verified 2026-09-19:** 264 tests pass (`uv run pytest -q`), ruff clean, the migration
+round-trips (`upgrade head` → `downgrade -1` → `upgrade head`) and `--autogenerate`
+against the upgraded database produces an empty migration, so the models and the schema
+agree.
+
+The storage layer was also driven against a **real S3 API** — MinIO, since there is no
+R2 bucket yet. It started as a throwaway container and is now the `minio` service in
+`docker-compose.yml` (host port 9010, bucket `neurex-documents`), with `backend/.env`
+pointing at it:
+
+- `R2Storage` directly: a 20-byte object took one `put_object`; a 16 MiB object took a
+  3-part multipart upload (ETag suffix `-3`); `open_stream` reassembled it byte for
+  byte; `exists`, `presigned_url` and a double `delete` behaved; a missing key raised
+  `ObjectNotFound`; and a stream that raised mid-upload left **zero** dangling
+  multipart uploads.
+- The whole API against it: register → create org → upload (201) → duplicate upload
+  (`deduplicated: true`, same document id, no second object) → version 2 → download
+  current (v2 bytes) and v1 (v1 bytes) → a 12 MiB upload whose download hashed
+  identical to the source → 64 random bytes named `.pdf` rejected **415** → delete
+  **204** → subsequent GET **404**. The bucket held exactly
+  `tenant_{org}/documents/{id}/versions/v{n}/source.pdf` and nothing else.
+- With storage unconfigured, upload and list both answered **503** with
+  `"Document storage is not configured on this server"`.
+
+The same end-to-end flow was re-run afterwards against the compose service rather than
+the throwaway container, with identical results, and the bucket again held only the
+three expected `tenant_.../versions/v{n}/source.pdf` keys with no dangling multipart
+uploads.
+
+---
+
 ---
 
 ## 3. Layout and conventions
@@ -249,7 +380,8 @@ backend/
 │   │   ├── middleware/
 │   │   └── routes/v1/
 │   ├── workers/      → ingestion + embedding workers (not started)
-│   └── shared/       → was `packages/` (not started)
+│   └── shared/       → library code, imported by api/ and workers/
+│       └── storage/  base.py (StorageProvider), r2.py — Phase 6
 ├── migrations/       → Alembic. Outside src/ — scripts, not importable code
 ├── tests/
 ├── alembic.ini
@@ -279,15 +411,31 @@ uv run alembic upgrade head
 ```
 
 ```bash
+# storage bucket — once, after the first `docker compose up`
+uv run python scripts/ensure_bucket.py
+```
+
+```bash
 # infrastructure, from repo root
 docker compose up -d
 docker compose ps          # want "healthy", not just "Up"
+
+# MinIO console (browser): http://127.0.0.1:9011
+# credentials: MINIO_ROOT_USER / MINIO_ROOT_PASSWORD in the root .env
 ```
 
 ### Dependencies
 
-Runtime: `fastapi`, `uvicorn`, `pydantic`, `pydantic-settings`, `structlog`, `sqlalchemy[asyncio]`, `asyncpg`, `alembic`
-Dev: `ruff`, `colorama`
+Runtime: `fastapi`, `uvicorn`, `pydantic`, `pydantic-settings`, `structlog`, `sqlalchemy[asyncio]`, `asyncpg`, `alembic`, `argon2-cffi`, `bcrypt`, `pyjwt`, `redis`, `aioboto3`, `python-multipart`
+Dev: `ruff`, `colorama`, `pytest`, `pytest-asyncio`, `httpx`, `fakeredis`
+
+`aioboto3` (Phase 6) pulls `boto3`/`botocore`/`aiohttp` — 21 packages for one S3
+client. `python-multipart` is not optional: FastAPI's `UploadFile` does nothing
+without it.
+
+**No `python-magic`.** Magic-byte sniffing is a signature table in
+`api/services/file_validation.py`. `libmagic` needs a binary on Windows and answers
+questions this system never asks; the allowlist is five formats long.
 
 ---
 
@@ -432,6 +580,61 @@ caught by the live smoke test, not by the suite, because the tests assert the da
 value. `await session.refresh(organization)` after the commit is the fix, and the same
 applies to any response returning a trigger-maintained column.
 
+### 5.13 A server-side `onupdate` leaves the column expired after `commit()`
+
+`TimestampMixin.updated_at` carries `onupdate=func.now()`, so after an UPDATE the
+session does not know the new value and marks the attribute expired — even with
+`expire_on_commit=False`, which only governs *commit*, not the flush's own
+expiry. Serialising the row then triggers a lazy load outside the async greenlet and
+the request dies with:
+
+```
+MissingGreenlet: greenlet_spawn has not been called; can't call await_only() here
+```
+
+It surfaced at `DocumentResponse.model_validate(document)` in the rename and
+add-version routes — far from its cause, and only on paths that UPDATE and then return
+the row. `await session.refresh(instance)` after the commit is the fix. Related to
+5.12 but a different mechanism: 5.12 is a value a *trigger* wrote, this is a value the
+*column* asked the server for.
+
+### 5.14 `func.now()` is the transaction timestamp, and the suite is one transaction
+
+PostgreSQL's `now()` is `transaction_timestamp()`, not the clock. Every test runs
+inside the outer transaction opened by the `connection` fixture, so **every row any
+test writes shares one `created_at`** — and an assertion like "newest first" has
+nothing to sort by and passes or fails on which row the planner happened to return.
+
+It cost a full-suite run to find, because a two-row ordering assertion is a coin flip
+that had been landing heads. Ordering is now asserted in
+`tests/test_document_repository.py`, which sets `created_at` explicitly; the HTTP suite
+asserts membership and totals instead. Anything time-ordered in a later phase has the
+same problem.
+
+### 5.15 An abandoned S3 multipart upload is invisible and billed
+
+Parts uploaded to an incomplete multipart upload do not appear in a bucket listing and
+are stored — and charged for — until a lifecycle rule removes them. `put_stream`
+therefore catches `BaseException`, not `Exception`: a cancelled request is exactly when
+an upload gets abandoned mid-flight, and `CancelledError` does not inherit from
+`Exception`. Verified against MinIO: after a stream that raised at the first part
+boundary, `list_multipart_uploads` returned nothing.
+
+The provider also only opens a multipart upload once the buffer passes `PART_SIZE`
+(8 MiB); below that it is a single `put_object`. S3 rejects a completed multipart
+upload whose non-final parts are under 5 MiB, so that threshold is a floor, not a
+preference.
+
+### 5.16 FastAPI reads a multipart body *before* it solves dependencies
+
+For a route with a `File()` parameter, the body is parsed first and the dependencies —
+including `get_org_context` — run after. It does not weaken isolation: a JSON body sent
+to a multipart route parses as an empty form, so the outsider still gets the 404 that
+`SCOPED_ROUTES` asserts. It does mean an oversized body is read before any
+authorization check, which is why `enforce_content_length` rejects on the header. The
+byte count taken while streaming remains the only real guarantee, since the header is
+client-supplied.
+
 
 ---
 
@@ -458,6 +661,38 @@ applies to any response returning a trigger-maintained column.
   concurrent case where two requests both pass the guard. Reproducing that race needs
   two connections committing in lockstep; the DB half is covered by
   `tests/test_admin_count.py`, the translation half is not.
-- **Tests:** 177 passing — repositories, admin-count trigger, auth flow and security,
-  RBAC (63), cross-tenant isolation (28) and membership lifecycle (25), on a
-  session-scoped engine through PgBouncer with per-test rollback.
+- **R2 itself has never been touched.** The S3 client is verified against MinIO, which
+  is S3-compatible but not R2: R2 differs on request checksums and on some multipart
+  edge cases, and `R2Storage` sets `signature_version="s3v4"` for that reason. The
+  first run against a real bucket is the one to watch, and it needs credentials this
+  project does not have yet.
+- **No orphan sweep.** `_discard` deletes the object when an upload deduplicates or a
+  database write fails, but a process killed between `put_stream` and `commit` leaves
+  an object nothing points at. A reconciliation job — list the tenant prefix, drop keys
+  with no `document_versions` row — belongs with the retention work, and a bucket
+  lifecycle rule for incomplete multipart uploads belongs with it.
+- **One S3 client per request.** `R2Storage._client()` opens an aioboto3 client per
+  operation. It costs about a millisecond and no round trip, and a long-lived client
+  shared across event-loop lifecycles is not obviously safe; if it shows up in a
+  profile, Phase 28 is where it changes, with a measurement.
+- **`StorageProvider.presigned_url` is implemented and unused.** Kept because the
+  decision to hand bytes to something outside the API belongs to a route, but it is
+  untested beyond the MinIO run and will rot if nothing calls it.
+- **MinIO is an unconditional compose service.** It starts with everything else, which
+  is right for now and wrong once there is a real R2: it should move behind a Compose
+  profile (`profiles: [dev]`) so `docker compose up -d` in a deployed environment does
+  not start a storage server nobody uses. One line, deferred because no deployed
+  environment exists yet.
+- **The end-to-end runs left data behind** — three objects in the `neurex-documents`
+  bucket and a handful of rows (users, organizations, documents) in the dev database,
+  from throwaway accounts. Harmless, and not cleaned up because deleting rows other
+  rows reference is a worse idea than leaving 12 MiB of test data in a dev volume.
+- **Phase 6 is uncommitted.** `src/shared/`, `src/api/errors.py`, the document models,
+  schemas, service, repositories, routes, the migration, `scripts/ensure_bucket.py` and
+  five test files are all in the working tree, along with `pyproject.toml`/`uv.lock`
+  changes for `aioboto3` and `python-multipart`, the `minio` service in
+  `docker-compose.yml`, and the new `MINIO_*` keys in the root `.env.example`.
+- **Tests:** 264 passing — repositories, admin-count trigger, auth flow and security,
+  RBAC (63), cross-tenant isolation (37), membership lifecycle (25), documents over
+  HTTP (22), document repositories (11), file validation (42) and the R2 upload path
+  (5), on a session-scoped engine through PgBouncer with per-test rollback.

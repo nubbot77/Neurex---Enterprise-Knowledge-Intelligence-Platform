@@ -225,7 +225,7 @@ second half is what stops the default-deny guarantee from quietly regressing.
 
 ---
 
-## Phase 6 — Document Management
+## Phase 6 — Document Management ✅
 
 | # | Task | Difficulty |
 |---|---|---|

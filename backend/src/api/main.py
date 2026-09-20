@@ -5,14 +5,15 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from api.auth.exceptions import AuthError
 from api.auth.rbac import scan_permission_declarations
 from api.config.logging import configure_logging
 from api.config.settings import Settings, get_settings
 from api.db.redis import build_redis
 from api.db.session import build_engine, build_session_factory
+from api.errors import APIError
 from api.middleware.request_id import RequestIDMiddleware
-from api.routes.v1 import auth, health, me, members, orgs
+from api.routes.v1 import auth, documents, health, me, members, orgs
+from shared.storage.r2 import R2Storage
 
 logger = structlog.get_logger(__name__)
 
@@ -29,6 +30,16 @@ async def lifespan(app: FastAPI):
     # deny-list, so this connection pool is on the critical path of the whole API.
     app.state.redis = build_redis(settings)
 
+    # Storage is optional at boot and required at the document routes. An API that
+    # refuses to start without a bucket takes authentication, membership and every
+    # other phase down with it on a machine that has no R2 account; a document upload
+    # that answers 503 with a named reason does not.
+    if settings.storage_bucket and settings.storage_endpoint_url:
+        app.state.storage = R2Storage.from_settings(settings)
+    else:
+        app.state.storage = None
+        logger.warning("storage.unconfigured", detail="document routes will answer 503")
+
     logger.info("api.startup", environment=settings.environment)
     try:
         yield
@@ -38,15 +49,19 @@ async def lifespan(app: FastAPI):
         logger.info("api.shutdown")
 
 
-async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
-    """Map domain auth errors to responses, in one place.
+async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
+    """Map every domain error to a response, in one place.
+
+    Registered for ``APIError``, which ``AuthError`` (Phase 4) and the document errors
+    (Phase 6) both inherit — Starlette resolves a handler by walking the exception's
+    MRO, so one registration covers every phase, including ones not written yet.
 
     The client gets ``exc.detail``; the log gets ``exc.reason``. Keeping the two apart
     is what lets every credential failure return one uninformative body while the log
     still says which check failed.
     """
     logger.info(
-        "auth.request_rejected",
+        "api.request_rejected",
         reason=exc.reason,
         status_code=exc.status_code,
         path=request.url.path,
@@ -72,7 +87,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.add_middleware(RequestIDMiddleware)
-    app.add_exception_handler(AuthError, auth_error_handler)
+    app.add_exception_handler(APIError, api_error_handler)
 
     app.include_router(health.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
@@ -80,6 +95,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(orgs.creation_router, prefix="/api/v1")
     app.include_router(orgs.router, prefix="/api/v1")
     app.include_router(members.router, prefix="/api/v1")
+    app.include_router(documents.router, prefix="/api/v1")
 
     # Default deny, decided once at boot: every organization-scoped route is checked
     # for a declared permission, and the ones without are logged as errors. The

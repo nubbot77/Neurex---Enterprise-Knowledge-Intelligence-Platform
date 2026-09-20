@@ -6,6 +6,7 @@ invisible to autogenerate and silently produces an empty migration.
 """
 
 from api.models.audit import AuditLog
+from api.models.document import Document, DocumentStatus, DocumentVersion
 from api.models.membership import (
     AccountType,
     Membership,
@@ -18,6 +19,9 @@ from api.models.user import User
 __all__ = [
     "AccountType",
     "AuditLog",
+    "Document",
+    "DocumentStatus",
+    "DocumentVersion",
     "Membership",
     "MembershipRole",
     "MembershipStatus",
